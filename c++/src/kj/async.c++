@@ -1868,6 +1868,10 @@ void Event::armLast() {
   }
 }
 
+bool Event::isArmed() {
+  return prev != nullptr;
+}
+
 void Event::disarm() {
   if (prev != nullptr) {
     if (threadLocalEventLoop != &loop && threadLocalEventLoop != nullptr) {
@@ -2312,6 +2316,15 @@ ArrayJoinPromiseNodeBase::ArrayJoinPromiseNodeBase(
     builder.add(*this, kj::mv(promises[i]), output);
   }
   branches = builder.finish();
+
+  // Optimization: if all of our branches are ready, then we're ready, too. We can make this happen
+  // by firing off any already-armed branches right away.
+  for (auto& branch: branches) {
+    if (branch.isArmed()) {
+      branch.disarm();
+      branch.fire();
+    }
+  }
 
   if (branches.size() == 0) {
     onReadyEvent.arm();

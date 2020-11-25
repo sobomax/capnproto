@@ -20,6 +20,7 @@
 // THE SOFTWARE.
 
 #include <kj/async.h>
+#include <kj/array.h>
 #include <kj/compat/http.h>
 #include <kj/debug.h>
 #include <kj/test.h>
@@ -63,6 +64,70 @@ KJ_TEST("Simple coroutine test") {
   simpleCoroutine(kj::Promise<void>(kj::READY_NOW)).wait(waitScope);
 
   KJ_EXPECT(simpleCoroutine(kj::Promise<int>(123)).wait(waitScope) == 123);
+}
+
+struct Counter {
+  size_t& count;
+  Counter(size_t& count): count(count) {}
+  ~Counter() { ++count; }
+  KJ_DISALLOW_COPY(Counter);
+};
+
+kj::Promise<void> countDtorsAroundAwait(size_t& count, kj::Promise<void> promise) {
+  Counter counter1(count);
+  co_await promise;
+  Counter counter2(count);
+  co_return;
+};
+
+KJ_TEST("co_awaiting an immediate promise does not suspend") {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  {
+    size_t count = 0;
+
+    auto promise = kj::Promise<void>(kj::READY_NOW);
+    auto coroPromise = countDtorsAroundAwait(count, kj::READY_NOW);
+
+    // `coro` has not been destroyed yet, but it completed and unwound its frame.
+    KJ_EXPECT(count == 2);
+  }
+
+  {
+    size_t count = 0;
+
+    // Try a more complex example.
+    auto builder = kj::heapArrayBuilder<kj::Promise<void>>(4);
+    builder.add(kj::Promise<void>(kj::READY_NOW));
+    builder.add(kj::Promise<int>(123).ignoreResult());
+    builder.add(kj::evalNow([](){ return kj::Promise<void>(kj::READY_NOW); }).then([](){}));
+    builder.add(countDtorsAroundAwait(count, kj::READY_NOW));
+
+    auto promise = kj::joinPromises(builder.finish());
+    auto coroPromise = countDtorsAroundAwait(count, kj::mv(promise));
+
+    // Both coroutines completed and unwound their frames.
+    KJ_EXPECT(count == 4, count);
+  }
+}
+
+KJ_TEST("Coroutines can suspend with evalLater()") {
+  // We want to make sure that we can still return to the event loop when we want to.
+  //
+  // TODO(now): This test fails because evalLater() is an immediate promise.
+
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  size_t count = 0;
+  bool evalLaterRan = false;
+
+  auto promise = kj::evalLater([&]() { evalLaterRan = true; });
+  auto coroPromise = countDtorsAroundAwait(count, kj::mv(promise));
+
+  KJ_EXPECT(evalLaterRan == false);
+  KJ_EXPECT(count == 1, count);
 }
 
 KJ_TEST("Exceptions propagate through layered coroutines") {
@@ -118,13 +183,6 @@ KJ_TEST("Coroutines can catch exceptions from co_await") {
     KJ_EXPECT(tryCatch(kj::mv(promise)).wait(waitScope) == "catch me");
   }
 }
-
-struct Counter {
-  size_t& count;
-  Counter(size_t& count): count(count) {}
-  ~Counter() { ++count; }
-  KJ_DISALLOW_COPY(Counter);
-};
 
 KJ_TEST("Coroutines can be canceled while suspended") {
   EventLoop loop;
