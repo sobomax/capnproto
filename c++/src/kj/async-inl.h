@@ -1659,9 +1659,6 @@ public:
         // Since we know we're unwinding due to a successful completion, we also know that whatever
         // Event we may have armed has not yet fired, because we haven't had a chance to return to
         // the event loop.
-        //
-        // TODO(now): Will the above be true (throwing being the only way to reject a coroutine)
-        //  with -fno-exceptions?
 
         // return_value()/return_void() has already been called.
         KJ_IASSERT(result.value != nullptr);
@@ -1697,30 +1694,6 @@ public:
   // a type-erased `await_suspend(stdcoro::coroutine_handle<void>)` override, and implement
   // suspension and resumption in terms of .then(). Yuck!
 
-  bool awaitSuspend(PromiseNode& nodeParam, ExceptionOrValue& awaitResultParam) {
-    // Called by Awaiter::await_suspend() to tell us to wait for `node` to become ready, then store
-    // the node's result in `awaitResult`. Returns true if the result is immediately ready, in which
-    // case the caller should immediately resume.
-
-    nodeParam.onReady(this);
-
-    if (isArmed()) {
-      // The result is immediately ready! Let's cancel our event and extract the result now.
-      disarm();
-      nodeParam.get(awaitResultParam);
-      return true;
-    }
-
-    // We'll need to save these references for fire(). Note that Awaiter is movable, and
-    // `awaitResult` is its subobject, but it is safe to store a reference to `awaitResult`, because
-    // by the time `await_suspend()` is called, Awaiter has already been returned from
-    // `await_transform()` and stored in its final resting place in the coroutine's frame.
-    node = &nodeParam;
-    awaitResult = &awaitResultParam;
-
-    return false;
-  }
-
 private:
   // -------------------------------------------------------
   // PromiseNode implementation
@@ -1737,23 +1710,18 @@ private:
   // Event implementation
 
   Maybe<Own<Event>> fire() override {
-    // The promise this coroutine is currently waiting on is ready. Extract its result and check for
-    // exceptions.
-
-    // TODO(now): I'm leaving this here because we'll need this in the -fno-exceptions change.
-    node->get(*awaitResult);
-
     // Call Awaiter::await_resume() and proceed with the coroutine. Note that this will not destroy
     // the coroutine if control flows off the end of it, because we return suspend_always() from
     // final_suspend().
     //
-    // It's tempting to check for exceptions right now and reject the promise that owns us without
-    // resuming the coroutine, which would save us from throwing an exception when we already know
-    // where it's going. But, we don't really know: the `co_await` might be in a try-catch block, so
-    // we have no choice but to resume and throw in this case.
+    // It's tempting to arrange to check for exceptions right now and reject the promise that owns
+    // us without resuming the coroutine, which would save us from throwing an exception when we
+    // already know where it's going. But, we don't really know: unlike in the KJ_NO_EXCEPTIONS
+    // case, the `co_await` might be in a try-catch block, so we have no choice but to resume and
+    // throw later.
     //
-    // TODO(now): Check for exceptions right here if we're compiled with -fno-exceptions, in which
-    //   case we know for sure there's no try-catch block around us.
+    // TODO(someday): If we ever support coroutines with -fno-exceptions, we'll need to reject the
+    //   enclosing coroutine promise here, if the Awaiter's result is exceptional.
     auto coroutine = Handle::from_promise(*this);
     coroutine.resume();
 
@@ -1785,10 +1753,6 @@ private:
   // to point to a DisposalResults on the stack so unhandled_exception() will have some place to
   // store unwind exceptions. We can't store them in this Coroutine, because we'll be destroyed once
   // coroutine.destroy() has returned. Our disposer then rethrows as needed.
-
-  PromiseNode* node = nullptr;
-  ExceptionOrValue* awaitResult = nullptr;
-  // Set by awaitSuspend(), used (and reset) in fire().
 
   friend class CoroutineBase<Coroutine<T>, T>;
 };
@@ -1843,8 +1807,10 @@ public:
   // adding a new isReady() virtual function to PromiseNode which everyone would have to implement.
 
   U await_resume() {
+    auto& node = PromiseNode::from(promise);
+    node.get(result);
+
     KJ_IF_MAYBE(exception, result.exception) {
-      // TODO(now): Throw recoverable exception if both exception and value are set?
       kj::throwFatalException(kj::mv(*exception));
     }
 
@@ -1854,10 +1820,17 @@ public:
   }
 
   stdcoro::coroutine_handle<void> await_suspend(Coroutine::Handle coroutine) {
-    if (coroutine.promise().awaitSuspend(PromiseNode::from(promise), result)) {
-      // Our promise is immediately available! We can resume ourselves by returning our own handle.
-      // This accomplishes the same thing as if we had extracted the result of the node and returned
-      // true from await_ready().
+    auto& node = PromiseNode::from(promise);
+    auto& coroutineEvent = coroutine.promise();
+
+    node.onReady(&coroutineEvent);
+
+    if (coroutineEvent.isArmed()) {
+      // The result is immediately ready! Let's cancel our event.
+      coroutineEvent.disarm();
+
+      // We can resume ourselves by returning our own handle. This accomplishes the same thing as if
+      // we had extracted returned true from await_ready().
       return coroutine;
     } else {
       // Otherwise, we must suspend, so we return dummy coroutine_handle.
