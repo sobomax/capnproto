@@ -1776,6 +1776,10 @@ public:
 // both a `return_value()` and `return_void()`. No amount of EnableIffery can get around it, so
 // these return_* functions live in a CRTP mixin.
 
+static stdcoro::coroutine_handle<void> noopCoroutine() noexcept;
+// TODO(msvc): Coroutines TS implementation doesn't have std::experimental::noop_coroutine(), so
+//   we'll roll our own below. This function is static so we can keep libkj coroutines header-only.
+
 template <typename T>
 template <typename U>
 class Coroutine<T>::Awaiter {
@@ -1833,8 +1837,8 @@ public:
       // we had extracted returned true from await_ready().
       return coroutine;
     } else {
-      // Otherwise, we must suspend, so we return dummy coroutine_handle.
-      return stdcoro::noop_coroutine();
+      // Otherwise, we must suspend, so we return a dummy coroutine_handle.
+      return noopCoroutine();
     }
   }
 
@@ -1843,6 +1847,35 @@ private:
   Promise<U> promise;
   ExceptionOr<FixVoid<U>> result;
 };
+
+inline static stdcoro::coroutine_handle<void> noopCoroutine() noexcept {
+#if _MSC_VER
+  // TODO(msvc): MSVC's Coroutines TS doesn't have std::experimental::noop_coroutine(), so we need to
+  //   roll our own. Remove this once we can upgrade to C++20 Coroutines in MSVC.
+  //
+  //   Inspired by https://www.reddit.com/r/cpp/comments/gihi0e/any_workaround_for_noopcoroutines_for_msvc/fqgmtjl/?utm_source=reddit&utm_medium=web2x&context=3
+
+  struct NoopCoroutine {
+    using Handle = stdcoro::coroutine_handle<void>;
+    Handle coroutine;
+
+    struct promise_type {
+      NoopCoroutine get_return_object() { return { Handle::from_address(this) }; }
+      auto initial_suspend() { return stdcoro::suspend_never(); }
+      auto final_suspend() noexcept { return stdcoro::suspend_never(); }
+      void return_void() { KJ_UNREACHABLE; }
+    };
+  };
+
+  static thread_local stdcoro::coroutine_handle<void> coroutine = []() -> NoopCoroutine {
+    while (true) { co_await stdcoro::suspend_always{}; }
+  }().coroutine;
+
+  return coroutine;
+#else
+  return stdcoro::noop_coroutine();
+#endif
+}
 
 #undef KJ_COROUTINE_STD_NAMESPACE
 
