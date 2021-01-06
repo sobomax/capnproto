@@ -536,7 +536,7 @@ EncodingResult<Array<byte>> decodeBinaryUriComponent(
 
 // =======================================================================================
 
-String encodeCEscape(ArrayPtr<const byte> bytes) {
+String encodeCEscapeImpl(ArrayPtr<const byte> bytes, bool isBinary) {
   Vector<char> escaped(bytes.size());
 
   for (byte b: bytes) {
@@ -552,7 +552,7 @@ String encodeCEscape(ArrayPtr<const byte> bytes) {
       case '\"': escaped.addAll(StringPtr("\\\"")); break;
       case '\\': escaped.addAll(StringPtr("\\\\")); break;
       default:
-        if (b < 0x20 || b == 0x7f) {
+        if (b < 0x20 || b == 0x7f || (isBinary && b > 0x7f)) {
           // Use octal escape, not hex, because hex escapes technically have no length limit and
           // so can create ambiguity with subsequent characters.
           escaped.add('\\');
