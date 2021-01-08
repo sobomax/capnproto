@@ -536,6 +536,8 @@ EncodingResult<Array<byte>> decodeBinaryUriComponent(
 
 // =======================================================================================
 
+namespace _ { // private
+
 String encodeCEscapeImpl(ArrayPtr<const byte> bytes, bool isBinary) {
   Vector<char> escaped(bytes.size());
 
@@ -569,6 +571,8 @@ String encodeCEscapeImpl(ArrayPtr<const byte> bytes, bool isBinary) {
   escaped.add(0);
   return String(escaped.releaseAsArray());
 }
+
+} // namespace
 
 EncodingResult<Array<byte>> decodeBinaryCEscape(ArrayPtr<const char> text, bool nulTerminate) {
   Vector<byte> result(text.size() + nulTerminate);

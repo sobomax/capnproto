@@ -197,7 +197,6 @@ EncodingResult<Array<byte>> decodeBinaryUriComponent(
 // Decode URI components using % escapes. This is a lower-level interface used to implement both
 // `decodeUriComponent()` and `decodeWwwForm()`
 
-String encodeCEscapeImpl(ArrayPtr<const byte> bytes, bool isBinary);
 String encodeCEscape(ArrayPtr<const byte> bytes);
 String encodeCEscape(ArrayPtr<const char> bytes);
 EncodingResult<Array<byte>> decodeBinaryCEscape(
@@ -247,6 +246,8 @@ const T* readMaybe(const EncodingResult<T>& value) {
   }
 }
 
+String encodeCEscapeImpl(ArrayPtr<const byte> bytes, bool isBinary);
+
 }  // namespace _ (private)
 
 inline String encodeUriComponent(ArrayPtr<const char> text) {
@@ -277,11 +278,11 @@ inline EncodingResult<String> decodeWwwForm(ArrayPtr<const char> text) {
 }
 
 inline String encodeCEscape(ArrayPtr<const char> text) {
-  return encodeCEscapeImpl(text.asBytes(), false);
+  return _::encodeCEscapeImpl(text.asBytes(), false);
 }
 
 inline String encodeCEscape(ArrayPtr<const byte> bytes) {
-  return encodeCEscapeImpl(bytes, true);
+  return _::encodeCEscapeImpl(bytes, true);
 }
 
 inline EncodingResult<String> decodeCEscape(ArrayPtr<const char> text) {
