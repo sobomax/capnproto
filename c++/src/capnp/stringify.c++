@@ -140,8 +140,8 @@ static kj::StringTree print(const DynamicValue::Reader& value,
         return kj::strTree(value.as<double>());
       }
     case DynamicValue::TEXT: {
-      kj::ArrayPtr<const byte> chars = value.as<Text>().asBytes();
-      return kj::strTree('"', kj::encodeCEscape(bytes), '"');
+      kj::ArrayPtr<const char> chars = value.as<Text>();
+      return kj::strTree('"', kj::encodeCEscape(chars), '"');
     }
     case DynamicValue::DATA: {
       // TODO(someday): Maybe data should be printed as binary literal.
