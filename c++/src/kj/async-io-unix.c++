@@ -1487,7 +1487,11 @@ kj::Own<PeerIdentity> SocketAddress::getIdentity(kj::LowLevelAsyncIoProvider& ll
       // MacOS / FreeBSD
       struct xucred creds;
       uint length = sizeof(creds);
+#if defined SOL_LOCAL
       stream.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, &creds, &length);
+#else
+      stream.getsockopt(0, LOCAL_PEERCRED, &creds, &length);
+#endif
       KJ_ASSERT(length == sizeof(creds));
       if (creds.cr_uid != static_cast<uid_t>(-1)) {
         result.uid = creds.cr_uid;
