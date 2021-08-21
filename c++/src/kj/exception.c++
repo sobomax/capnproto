@@ -40,6 +40,7 @@
 #include "threadlocal.h"
 #include "miniposix.h"
 #include "function.h"
+#include "main.h"
 #include <stdlib.h>
 #include <exception>
 #include <new>
@@ -85,6 +86,25 @@
 #if _MSC_VER
 #include <intrin.h>
 #endif
+
+#if KJ_HAS_COMPILER_FEATURE(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+#include <sanitizer/lsan_interface.h>
+#else
+static void __lsan_ignore_object(const void* p) {}
+#endif
+// TODO(cleanup): Remove the LSAN stuff per https://github.com/capnproto/capnproto/pull/1255
+// feedback.
+
+namespace {
+template <typename T>
+inline T* lsanIgnoreObjectAndReturn(T* ptr) {
+  // Defensively lsan_ignore_object since the documentation doesn't explicitly specify what happens
+  // if you call this multiple times on the same object.
+  // TODO(cleanup): Remove this per https://github.com/capnproto/capnproto/pull/1255.
+  __lsan_ignore_object(ptr);
+  return ptr;
+}
+}
 
 namespace kj {
 
@@ -425,7 +445,7 @@ namespace {
 
 #if !KJ_NO_EXCEPTIONS
 
-void terminateHandler() {
+[[noreturn]] void terminateHandler() {
   void* traceSpace[32];
 
   // ignoreCount = 3 to ignore std::terminate entry.
@@ -565,7 +585,7 @@ void printStackTraceOnCrash() {
 #else
 namespace {
 
-void crashHandler(int signo, siginfo_t* info, void* context) {
+[[noreturn]] void crashHandler(int signo, siginfo_t* info, void* context) {
   void* traceSpace[32];
 
 #if KJ_USE_WIN32_DBGHELP
@@ -725,7 +745,7 @@ String KJ_STRINGIFY(const Exception& e) {
   for (;;) {
     KJ_IF_MAYBE(c, contextPtr) {
       contextText[contextDepth++] =
-          str(c->file, ":", c->line, ": context: ", c->description, "\n");
+          str(trimSourceFilename(c->file), ":", c->line, ": context: ", c->description, "\n");
       contextPtr = c->next;
     } else {
       break;
@@ -915,6 +935,32 @@ Maybe<const Exception&> InFlightExceptionIterator::next() {
 
 #endif  // !KJ_NO_EXCEPTIONS
 
+kj::Exception getDestructionReason(void* traceSeparator, kj::Exception::Type defaultType,
+    const char* defaultFile, int defaultLine, kj::StringPtr defaultDescription) {
+#if !KJ_NO_EXCEPTIONS
+  InFlightExceptionIterator iter;
+  KJ_IF_MAYBE(e, iter.next()) {
+    auto copy = kj::cp(*e);
+    copy.truncateCommonTrace();
+    return copy;
+  } else {
+#endif
+    // Darn, use a generic exception.
+    kj::Exception exception(defaultType, defaultFile, defaultLine,
+        kj::heapString(defaultDescription));
+
+    // Let's give some context on where the PromiseFulfiller was destroyed.
+    exception.extendTrace(2, 16);
+
+    // Add a separator that hopefully makes this understandable...
+    exception.addTrace(traceSeparator);
+
+    return exception;
+#if !KJ_NO_EXCEPTIONS
+  }
+#endif
+}
+
 // =======================================================================================
 
 namespace {
@@ -925,9 +971,11 @@ KJ_THREADLOCAL_PTR(ExceptionCallback) threadLocalCallback = nullptr;
 
 ExceptionCallback::ExceptionCallback(): next(getExceptionCallback()) {
   char stackVar;
+#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
   ptrdiff_t offset = reinterpret_cast<char*>(this) - &stackVar;
   KJ_ASSERT(offset < 65536 && offset > -65536,
             "ExceptionCallback must be allocated on the stack.");
+#endif
 
   threadLocalCallback = this;
 }
@@ -1041,9 +1089,34 @@ private:
 };
 
 ExceptionCallback& getExceptionCallback() {
-  static ExceptionCallback::RootExceptionCallback defaultCallback;
+  static auto defaultCallback = lsanIgnoreObjectAndReturn(
+      new ExceptionCallback::RootExceptionCallback());
+  // We allocate on the heap because some objects may throw in their destructors. If those objects
+  // had static storage, they might get fully constructed before the root callback. If they however
+  // then throw an exception during destruction, there would be a lifetime issue because their
+  // destructor would end up getting registered after the root callback's destructor. One solution
+  // is to just leak this pointer & allocate on first-use. The cost is that the initialization is
+  // mildly more expensive (+ we need to annotate sanitizers to ignore the problem). A great
+  // compiler annotation that would simply things would be one that allowed static variables to have
+  // their destruction omitted wholesale. That would allow us to avoid the heap but still have the
+  // same robust safety semantics leaking would give us. A practical alternative that could be
+  // implemented without new compilers would be to define another static root callback in
+  // RootExceptionCallback's destructor (+ a separate pointer to share its value with this
+  // function). Since this would end up getting constructed during exit unwind, it would have the
+  // nice property of effectively being guaranteed to be evicted last.
+  //
+  // All this being said, I came back to leaking the object is the easiest tweak here:
+  //  * Can't go wrong
+  //  * Easy to maintain
+  //  * Throwing exceptions is bound to do be expensive and malloc-happy anyway, so the incremental
+  //    cost of 1 heap allocation is minimal.
+  //
+  // TODO(cleanup): Harris has an excellent suggestion in
+  //  https://github.com/capnproto/capnproto/pull/1255 that should ensure we initialize the root
+  //  callback once on first use as a global & never destroy it.
+
   ExceptionCallback* scoped = threadLocalCallback;
-  return scoped != nullptr ? *scoped : defaultCallback;
+  return scoped != nullptr ? *scoped : *defaultCallback;
 }
 
 void throwFatalException(kj::Exception&& exception, uint ignoreCount) {
@@ -1260,6 +1333,8 @@ Maybe<Exception> runCatchingExceptions(Runnable& runnable) {
   } catch (std::exception& e) {
     return Exception(Exception::Type::FAILED,
                      "(unknown)", -1, str("std::exception: ", e.what()));
+  } catch (TopLevelProcessContext::CleanShutdownException) {
+    throw;
   } catch (...) {
 #if __GNUC__ && !KJ_NO_RTTI
     return Exception(Exception::Type::FAILED, "(unknown)", -1, str(

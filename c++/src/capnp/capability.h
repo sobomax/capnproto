@@ -59,6 +59,11 @@ public:
   RemotePromise(RemotePromise&& other) = default;
   RemotePromise& operator=(RemotePromise&& other) = default;
 
+  kj::Promise<Response<T>> dropPipeline() {
+    // Convenience method to convert this into a plain promise.
+    return kj::mv(*this);
+  }
+
   static RemotePromise<T> reducePromise(kj::Promise<RemotePromise>&& promise);
   // Hook for KJ so that Promise<RemotePromise<T>> automatically reduces to RemotePromise<T>.
 };
@@ -402,6 +407,7 @@ private:
 
   friend class Capability::Server;
   friend struct DynamicCapability;
+  friend class CallContextHook;
 };
 
 template <typename Params>
@@ -426,6 +432,7 @@ private:
 
   friend class Capability::Server;
   friend struct DynamicCapability;
+  friend class CallContextHook;
 };
 
 class Capability::Server {
@@ -769,6 +776,11 @@ public:
   // promise fulfiller for onTailCall() with the returned pipeline.
 
   virtual kj::Own<CallContextHook> addRef() = 0;
+
+  template <typename Params, typename Results>
+  static CallContextHook& from(CallContext<Params, Results>& context) { return *context.hook; }
+  template <typename Params>
+  static CallContextHook& from(StreamingCallContext<Params>& context) { return *context.hook; }
 };
 
 kj::Own<ClientHook> newLocalPromiseClient(kj::Promise<kj::Own<ClientHook>>&& promise);

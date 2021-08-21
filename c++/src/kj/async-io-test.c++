@@ -32,6 +32,7 @@
 #include "io.h"
 #include "miniposix.h"
 #include <kj/compat/gtest.h>
+#include <kj/time.h>
 #include <sys/types.h>
 #if _WIN32
 #include <ws2tcpip.h>
@@ -88,7 +89,7 @@ TEST(AsyncIo, SimpleNetwork) {
   EXPECT_EQ("foo", result);
 }
 
-#if !_WIN32  // TODO(soon): Implement NetworkPeerIdentity for Win32.
+#if !_WIN32  // TODO(0.10): Implement NetworkPeerIdentity for Win32.
 TEST(AsyncIo, SimpleNetworkAuthentication) {
   auto ioContext = setupAsyncIo();
   auto& network = ioContext.provider->getNetwork();
@@ -241,6 +242,126 @@ TEST(AsyncIo, UnixSocket) {
   }).wait(ioContext.waitScope);
 
   EXPECT_EQ("foo", result);
+}
+
+TEST(AsyncIo, AncillaryMessageHandlerNoMsg) {
+  auto ioContext = setupAsyncIo();
+  auto& network = ioContext.provider->getNetwork();
+
+  Own<ConnectionReceiver> listener;
+  Own<AsyncIoStream> server;
+  Own<AsyncIoStream> client;
+
+  char receiveBuffer[4];
+
+  bool clientHandlerCalled = false;
+  kj::Function<void(kj::ArrayPtr<AncillaryMessage>)> clientHandler =
+    [&](kj::ArrayPtr<AncillaryMessage>) {
+    clientHandlerCalled = true;
+  };
+  bool serverHandlerCalled = false;
+  kj::Function<void(kj::ArrayPtr<AncillaryMessage>)> serverHandler =
+    [&](kj::ArrayPtr<AncillaryMessage>) {
+    serverHandlerCalled = true;
+  };
+
+  auto port = newPromiseAndFulfiller<uint>();
+
+  port.promise.then([&](uint portnum) {
+    return network.parseAddress("localhost", portnum);
+  }).then([&](Own<NetworkAddress>&& addr) {
+    auto promise = addr->connectAuthenticated();
+    return promise.then([&,addr=kj::mv(addr)](AuthenticatedStream result) mutable {
+      client = kj::mv(result.stream);
+      client->registerAncillaryMessageHandler(kj::mv(clientHandler));
+      return client->write("foo", 3);
+    });
+  }).detach([](kj::Exception&& exception) {
+    KJ_FAIL_EXPECT(exception);
+  });
+
+  kj::String result = network.parseAddress("*").then([&](Own<NetworkAddress>&& result) {
+    listener = result->listen();
+    port.fulfiller->fulfill(listener->getPort());
+    return listener->acceptAuthenticated();
+  }).then([&](AuthenticatedStream result) {
+    server = kj::mv(result.stream);
+    server->registerAncillaryMessageHandler(kj::mv(serverHandler));
+    return server->tryRead(receiveBuffer, 3, 4);
+  }).then([&](size_t n) {
+    EXPECT_EQ(3u, n);
+    return heapString(receiveBuffer, n);
+  }).wait(ioContext.waitScope);
+
+  EXPECT_EQ("foo", result);
+  EXPECT_FALSE(clientHandlerCalled);
+  EXPECT_FALSE(serverHandlerCalled);
+}
+#endif
+
+// We only support ancillary messages on Unix.
+// MacOS only supports SO_TIMESTAMP on datagram sockets, so this test won't work.
+// Android fails this test for unknown reasons and I don't care because it's an extremely obscure
+// feature anyway.
+#if !_WIN32 && !__CYGWIN__  && !__APPLE__ && !__ANDROID__
+TEST(AsyncIo, AncillaryMessageHandler) {
+  auto ioContext = setupAsyncIo();
+  auto& network = ioContext.provider->getNetwork();
+
+  Own<ConnectionReceiver> listener;
+  Own<AsyncIoStream> server;
+  Own<AsyncIoStream> client;
+
+  char receiveBuffer[4];
+
+  bool clientHandlerCalled = false;
+  kj::Function<void(kj::ArrayPtr<AncillaryMessage>)> clientHandler =
+    [&](kj::ArrayPtr<AncillaryMessage>) {
+    clientHandlerCalled = true;
+  };
+  bool serverHandlerCalled = false;
+  kj::Function<void(kj::ArrayPtr<AncillaryMessage>)> serverHandler =
+    [&](kj::ArrayPtr<AncillaryMessage> msgs) {
+    serverHandlerCalled = true;
+    EXPECT_EQ(1, msgs.size());
+    EXPECT_EQ(SOL_SOCKET, msgs[0].getLevel());
+    EXPECT_EQ(SO_TIMESTAMP, msgs[0].getType());
+  };
+
+  auto port = newPromiseAndFulfiller<uint>();
+
+  port.promise.then([&](uint portnum) {
+    return network.parseAddress("localhost", portnum);
+  }).then([&](Own<NetworkAddress>&& addr) {
+    auto promise = addr->connectAuthenticated();
+    return promise.then([&,addr=kj::mv(addr)](AuthenticatedStream result) mutable {
+      client = kj::mv(result.stream);
+      client->registerAncillaryMessageHandler(kj::mv(clientHandler));
+      return client->write("foo", 3);
+    });
+  }).detach([](kj::Exception&& exception) {
+    KJ_FAIL_EXPECT(exception);
+  });
+
+  kj::String result = network.parseAddress("*").then([&](Own<NetworkAddress>&& result) {
+    listener = result->listen();
+    // Register interest in having the timestamp delivered via cmsg on each recvmsg.
+    int yes = 1;
+    listener->setsockopt(SOL_SOCKET, SO_TIMESTAMP, &yes, sizeof(yes));
+    port.fulfiller->fulfill(listener->getPort());
+    return listener->acceptAuthenticated();
+  }).then([&](AuthenticatedStream result) {
+    server = kj::mv(result.stream);
+    server->registerAncillaryMessageHandler(kj::mv(serverHandler));
+    return server->tryRead(receiveBuffer, 3, 4);
+  }).then([&](size_t n) {
+    EXPECT_EQ(3u, n);
+    return heapString(receiveBuffer, n);
+  }).wait(ioContext.waitScope);
+
+  EXPECT_EQ("foo", result);
+  EXPECT_FALSE(clientHandlerCalled);
+  EXPECT_TRUE(serverHandlerCalled);
 }
 #endif
 
@@ -931,8 +1052,10 @@ TEST(AsyncIo, Udp) {
 TEST(AsyncIo, AbstractUnixSocket) {
   auto ioContext = setupAsyncIo();
   auto& network = ioContext.provider->getNetwork();
+  auto elapsedSinceEpoch = systemPreciseMonotonicClock().now() - kj::origin<TimePoint>();
+  auto address = kj::str("unix-abstract:foo", getpid(), elapsedSinceEpoch / kj::NANOSECONDS);
 
-  Own<NetworkAddress> addr = network.parseAddress("unix-abstract:foo").wait(ioContext.waitScope);
+  Own<NetworkAddress> addr = network.parseAddress(address).wait(ioContext.waitScope);
 
   Own<ConnectionReceiver> listener = addr->listen();
   // chdir proves no filesystem dependence. Test fails for regular unix socket
@@ -1950,6 +2073,39 @@ KJ_TEST("Userland tee") {
   expectRead(*left, "foobar").wait(ws);
   writePromise.wait(ws);
   expectRead(*right, "foobar").wait(ws);
+}
+
+KJ_TEST("Userland nested tee") {
+  kj::EventLoop loop;
+  WaitScope ws(loop);
+
+  auto pipe = newOneWayPipe();
+  auto tee = newTee(kj::mv(pipe.in));
+  auto left = kj::mv(tee.branches[0]);
+  auto right = kj::mv(tee.branches[1]);
+
+  auto tee2 = newTee(kj::mv(right));
+  auto rightLeft = kj::mv(tee2.branches[0]);
+  auto rightRight = kj::mv(tee2.branches[1]);
+
+  auto writePromise = pipe.out->write("foobar", 6);
+
+  expectRead(*left, "foobar").wait(ws);
+  writePromise.wait(ws);
+  expectRead(*rightLeft, "foobar").wait(ws);
+  expectRead(*rightRight, "foo").wait(ws);
+
+  auto tee3 = newTee(kj::mv(rightRight));
+  auto rightRightLeft = kj::mv(tee3.branches[0]);
+  auto rightRightRight = kj::mv(tee3.branches[1]);
+  expectRead(*rightRightLeft, "bar").wait(ws);
+  expectRead(*rightRightRight, "b").wait(ws);
+
+  auto tee4 = newTee(kj::mv(rightRightRight));
+  auto rightRightRightLeft = kj::mv(tee4.branches[0]);
+  auto rightRightRightRight = kj::mv(tee4.branches[1]);
+  expectRead(*rightRightRightLeft, "ar").wait(ws);
+  expectRead(*rightRightRightRight, "ar").wait(ws);
 }
 
 KJ_TEST("Userland tee concurrent read") {

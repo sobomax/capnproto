@@ -112,8 +112,16 @@ Orphan<List<rpc::PromisedAnswer::Op>> fromPipelineOps(
 }
 
 kj::Exception toException(const rpc::Exception::Reader& exception) {
+  auto reason = [&]() {
+    if (exception.getReason().startsWith("remote exception: ")) {
+      return kj::str(exception.getReason());
+    } else {
+      return kj::str("remote exception: ", exception.getReason());
+    }
+  }();
+
   kj::Exception result(static_cast<kj::Exception::Type>(exception.getType()),
-      "(remote)", 0, kj::str("remote exception: ", exception.getReason()));
+      "(remote)", 0, kj::mv(reason));
   if (exception.hasTrace()) {
     result.setRemoteTrace(kj::str(exception.getTrace()));
   }
@@ -382,7 +390,9 @@ public:
 
       exports.forEach([&](ExportId id, Export& exp) {
         clientsToRelease.add(kj::mv(exp.clientHook));
-        resolveOpsToRelease.add(kj::mv(exp.resolveOp));
+        KJ_IF_MAYBE(op, exp.resolveOp) {
+          resolveOpsToRelease.add(kj::mv(*op));
+        }
         exp = Export();
       });
 
@@ -416,12 +426,18 @@ public:
     auto shutdownPromise = connection.get<Connected>()->shutdown()
         .attach(kj::mv(connection.get<Connected>()))
         .then([]() -> kj::Promise<void> { return kj::READY_NOW; },
-              [](kj::Exception&& e) -> kj::Promise<void> {
+              [origException = kj::mv(exception)](kj::Exception&& e) -> kj::Promise<void> {
           // Don't report disconnects as an error.
-          if (e.getType() != kj::Exception::Type::DISCONNECTED) {
-            return kj::mv(e);
+          if (e.getType() == kj::Exception::Type::DISCONNECTED) {
+            return kj::READY_NOW;
           }
-          return kj::READY_NOW;
+          // If the error is just what was passed in to disconnect(), don't report it back out
+          // since it shouldn't be anything the caller doesn't already know about.
+          if (e.getType() == origException.getType() &&
+              e.getDescription() == origException.getDescription()) {
+            return kj::READY_NOW;
+          }
+          return kj::mv(e);
         });
     disconnectFulfiller->fulfill(DisconnectInfo { kj::mv(shutdownPromise) });
     connection.init<Disconnected>(kj::mv(networkException));
@@ -518,7 +534,7 @@ private:
 
     kj::Own<ClientHook> clientHook;
 
-    kj::Promise<void> resolveOp = nullptr;
+    kj::Maybe<kj::Promise<void>> resolveOp = nullptr;
     // If this export is a promise (not a settled capability), the `resolveOp` represents the
     // ongoing operation to wait for that promise to resolve and then send a `Resolve` message.
 
@@ -1139,7 +1155,11 @@ private:
         // We've already seen and exported this capability before.  Just up the refcount.
         auto& exp = KJ_ASSERT_NONNULL(exports.find(iter->second));
         ++exp.refcount;
-        descriptor.setSenderHosted(iter->second);
+        if (exp.resolveOp == nullptr) {
+          descriptor.setSenderHosted(iter->second);
+        } else {
+          descriptor.setSenderPromise(iter->second);
+        }
         return iter->second;
       } else {
         // This is the first time we've seen this capability.
@@ -1759,6 +1779,7 @@ private:
         // table state. We'll have to reject the promise instead.
         result.question.isAwaitingReturn = false;
         result.question.skipFinish = true;
+        connectionState->releaseExports(result.question.paramExports);
         result.questionRef->reject(kj::mv(*exception));
       }
 
@@ -3074,15 +3095,15 @@ public:
   Impl(VatNetworkBase& network, kj::Maybe<Capability::Client> bootstrapInterface)
       : network(network), bootstrapInterface(kj::mv(bootstrapInterface)),
         bootstrapFactory(*this), tasks(*this) {
-    tasks.add(acceptLoop());
+    acceptLoopPromise = acceptLoop().eagerlyEvaluate([](kj::Exception&& e) { KJ_LOG(ERROR, e); });
   }
   Impl(VatNetworkBase& network, BootstrapFactoryBase& bootstrapFactory)
       : network(network), bootstrapFactory(bootstrapFactory), tasks(*this) {
-    tasks.add(acceptLoop());
+    acceptLoopPromise = acceptLoop().eagerlyEvaluate([](kj::Exception&& e) { KJ_LOG(ERROR, e); });
   }
   Impl(VatNetworkBase& network, SturdyRefRestorerBase& restorer)
       : network(network), bootstrapFactory(*this), restorer(restorer), tasks(*this) {
-    tasks.add(acceptLoop());
+    acceptLoopPromise = acceptLoop().eagerlyEvaluate([](kj::Exception&& e) { KJ_LOG(ERROR, e); });
   }
 
   ~Impl() noexcept(false) {
@@ -3091,7 +3112,7 @@ public:
       // disassemble it.
       if (!connections.empty()) {
         kj::Vector<kj::Own<RpcConnectionState>> deleteMe(connections.size());
-        kj::Exception shutdownException = KJ_EXCEPTION(FAILED, "RpcSystem was destroyed.");
+        kj::Exception shutdownException = KJ_EXCEPTION(DISCONNECTED, "RpcSystem was destroyed.");
         for (auto& entry: connections) {
           entry.second->disconnect(kj::cp(shutdownException));
           deleteMe.add(kj::mv(entry.second));
@@ -3135,6 +3156,8 @@ public:
     traceEncoder = kj::mv(func);
   }
 
+  kj::Promise<void> run() { return kj::mv(acceptLoopPromise); }
+
 private:
   VatNetworkBase& network;
   kj::Maybe<Capability::Client> bootstrapInterface;
@@ -3142,6 +3165,7 @@ private:
   kj::Maybe<SturdyRefRestorerBase&> restorer;
   size_t flowLimit = kj::maxValue;
   kj::Maybe<kj::Function<kj::String(const kj::Exception&)>> traceEncoder;
+  kj::Promise<void> acceptLoopPromise = nullptr;
   kj::TaskSet tasks;
 
   typedef std::unordered_map<VatNetworkBase::Connection*, kj::Own<RpcConnectionState>>
@@ -3172,16 +3196,10 @@ private:
   }
 
   kj::Promise<void> acceptLoop() {
-    auto receive = network.baseAccept().then(
+    return network.baseAccept().then(
         [this](kj::Own<VatNetworkBase::Connection>&& connection) {
       getConnectionState(kj::mv(connection));
-    });
-    return receive.then([this]() {
-      // No exceptions; continue loop.
-      //
-      // (We do this in a separate continuation to handle the case where exceptions are
-      // disabled.)
-      tasks.add(acceptLoop());
+      return acceptLoop();
     });
   }
 
@@ -3229,6 +3247,10 @@ void RpcSystemBase::baseSetFlowLimit(size_t words) {
 
 void RpcSystemBase::setTraceEncoder(kj::Function<kj::String(const kj::Exception&)> func) {
   impl->setTraceEncoder(kj::mv(func));
+}
+
+kj::Promise<void> RpcSystemBase::run() {
+  return impl->run();
 }
 
 }  // namespace _ (private)

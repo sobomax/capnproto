@@ -33,6 +33,8 @@
 
 KJ_BEGIN_HEADER
 
+#include "list.h"
+
 namespace kj {
 namespace _ {  // private
 
@@ -585,6 +587,11 @@ private:
 
 template <typename T> T copyOrAddRef(T& t) { return t; }
 template <typename T> Own<T> copyOrAddRef(Own<T>& t) { return t->addRef(); }
+template <typename T> Maybe<Own<T>> copyOrAddRef(Maybe<Own<T>>& t) {
+  return t.map([](Own<T>& ptr) {
+    return ptr->addRef();
+  });
+}
 
 template <typename T>
 class ForkBranch final: public ForkBranchBase {
@@ -1124,6 +1131,11 @@ Promise<T> ForkedPromise<T>::addBranch() {
 }
 
 template <typename T>
+bool ForkedPromise<T>::hasBranches() {
+  return hub->isShared();
+}
+
+template <typename T>
 _::SplitTuplePromise<T> Promise<T>::split() {
   return refcounted<_::ForkHub<_::FixVoid<T>>>(kj::mv(node))->split();
 }
@@ -1435,8 +1447,7 @@ private:
   kj::Maybe<Own<PromiseNode>> promiseNode;
   // Accessed only in target thread.
 
-  Maybe<XThreadEvent&> targetNext;
-  Maybe<XThreadEvent&>* targetPrev = nullptr;
+  ListLink<XThreadEvent> targetLink;
   // Membership in one of the linked lists in the target Executor's work list or cancel list. These
   // fields are protected by the target Executor's mutex.
 
@@ -1465,8 +1476,7 @@ private:
   } state = UNUSED;
   // State, which is also protected by `targetExecutor`'s mutex.
 
-  Maybe<XThreadEvent&> replyNext;
-  Maybe<XThreadEvent&>* replyPrev = nullptr;
+  ListLink<XThreadEvent> replyLink;
   // Membership in `replyExecutor`'s reply list. Protected by `replyExecutor`'s mutex. The
   // executing thread places the event in the reply list near the end of the `EXECUTING` state.
   // Because the thread cannot lock two mutexes at once, it's possible that the reply executor
@@ -1576,6 +1586,178 @@ PromiseForResult<Func, void> Executor::executeAsync(Func&& func) const {
   auto event = kj::heap<_::XThreadEventImpl<Func>>(kj::fwd<Func>(func), *this);
   send(*event, false);
   return _::PromiseNode::to<PromiseForResult<Func, void>>(kj::mv(event));
+}
+
+// -----------------------------------------------------------------------------
+
+namespace _ {  // (private)
+
+template <typename T>
+class XThreadFulfiller;
+
+class XThreadPaf: public PromiseNode {
+public:
+  XThreadPaf();
+  virtual ~XThreadPaf() noexcept(false);
+
+  class Disposer: public kj::Disposer {
+  public:
+    void disposeImpl(void* pointer) const override;
+  };
+  static const Disposer DISPOSER;
+
+  // implements PromiseNode ----------------------------------------------------
+  void onReady(Event* event) noexcept override;
+  void tracePromise(TraceBuilder& builder, bool stopAtNextEvent) override;
+
+private:
+  enum {
+    WAITING,
+    // Not yet fulfilled, and the waiter is still waiting.
+    //
+    // Starting from this state, the state may transition to either FULFILLING or CANCELED
+    // using an atomic compare-and-swap.
+
+    FULFILLING,
+    // The fulfiller thread atomically transitions the state from WAITING to FULFILLING when it
+    // wishes to fulfill the promise. By doing so, it guarantees that the `executor` will not
+    // disappear out from under it. It then fills in the result value, locks the executor mutex,
+    // adds the object to the executor's list of fulfilled XThreadPafs, changes the state to
+    // FULFILLED, and finally unlocks the mutex.
+    //
+    // If the waiting thread tries to cancel but discovers the object in this state, then it
+    // must perform a conditional wait on the executor mutex to await the state becoming FULFILLED.
+    // It can then delete the object.
+
+    FULFILLED,
+    // The fulfilling thread has completed filling in the result value and inserting the object
+    // into the waiting thread's executor event queue. Moreover, the fulfilling thread no longer
+    // holds any pointers to this object. The waiting thread is responsible for deleting it.
+
+    DISPATCHED,
+    // The object reached FULFILLED state, and then was dispatched from the waiting thread's
+    // executor's event queue. Therefore, the object is completely owned by the waiting thread with
+    // no need to lock anything.
+
+    CANCELED
+    // The waiting thread atomically transitions the state from WAITING to CANCELED if it is no
+    // longer listening. In this state, it is the fulfiller thread's responsibility to destroy the
+    // object.
+  } state;
+
+  const Executor& executor;
+  // Executor of the waiting thread. Only guaranteed to be valid when state is `WAITING` or
+  // `FULFILLING`. After any other state has been reached, this reference may be invalidated.
+
+  ListLink<XThreadPaf> link;
+  // In the FULFILLING/FULFILLED states, the object is placed in a linked list within the waiting
+  // thread's executor. In those states, these pointers are guarded by said executor's mutex.
+
+  OnReadyEvent onReadyEvent;
+
+  class FulfillScope;
+
+  static kj::Exception unfulfilledException();
+  // Construct appropriate exception to use to reject an unfulfilled XThreadPaf.
+
+  template <typename T>
+  friend class XThreadFulfiller;
+  friend Executor;
+};
+
+template <typename T>
+class XThreadPafImpl final: public XThreadPaf {
+public:
+  // implements PromiseNode ----------------------------------------------------
+  void get(ExceptionOrValue& output) noexcept override {
+    output.as<FixVoid<T>>() = kj::mv(result);
+  }
+
+private:
+  ExceptionOr<FixVoid<T>> result;
+
+  friend class XThreadFulfiller<T>;
+};
+
+class XThreadPaf::FulfillScope {
+  // Create on stack while setting `XThreadPafImpl<T>::result`.
+  //
+  // This ensures that:
+  // - Only one call is carried out, even if multiple threads try to fulfill concurrently.
+  // - The waiting thread is correctly signaled.
+public:
+  FulfillScope(XThreadPaf** pointer);
+  // Atomically nulls out *pointer and takes ownership of the pointer.
+
+  ~FulfillScope() noexcept(false);
+
+  KJ_DISALLOW_COPY(FulfillScope);
+
+  bool shouldFulfill() { return obj != nullptr; }
+
+  template <typename T>
+  XThreadPafImpl<T>* getTarget() { return static_cast<XThreadPafImpl<T>*>(obj); }
+
+private:
+  XThreadPaf* obj;
+};
+
+template <typename T>
+class XThreadFulfiller final: public CrossThreadPromiseFulfiller<T> {
+public:
+  XThreadFulfiller(XThreadPafImpl<T>* target): target(target) {}
+
+  ~XThreadFulfiller() noexcept(false) {
+    if (target != nullptr) {
+      reject(XThreadPaf::unfulfilledException());
+    }
+  }
+  void fulfill(FixVoid<T>&& value) const override {
+    XThreadPaf::FulfillScope scope(&target);
+    if (scope.shouldFulfill()) {
+      scope.getTarget<T>()->result = kj::mv(value);
+    }
+  }
+  void reject(Exception&& exception) const override {
+    XThreadPaf::FulfillScope scope(&target);
+    if (scope.shouldFulfill()) {
+      scope.getTarget<T>()->result.addException(kj::mv(exception));
+    }
+  }
+  bool isWaiting() const override {
+    KJ_IF_MAYBE(t, target) {
+#if _MSC_VER && !__clang__
+      // Just assume 1-byte loads are atomic... on what kind of absurd platform would they not be?
+      return t->state == XThreadPaf::WAITING;
+#else
+      return __atomic_load_n(&t->state, __ATOMIC_RELAXED) == XThreadPaf::WAITING;
+#endif
+    } else {
+      return false;
+    }
+  }
+
+private:
+  mutable XThreadPaf* target;  // accessed using atomic ops
+};
+
+template <typename T>
+class XThreadFulfiller<kj::Promise<T>> {
+public:
+  static_assert(sizeof(T) < 0,
+      "newCrosssThreadPromiseAndFulfiller<Promise<T>>() is not currently supported");
+  // TODO(someday): Is this worth supporting? Presumably, when someone calls `fulfill(somePromise)`,
+  //   then `somePromise` should be assumed to be a promise owned by the fulfilling thread, not
+  //   the waiting thread.
+};
+
+}  // namespace _ (private)
+
+template <typename T>
+PromiseCrossThreadFulfillerPair<T> newPromiseAndCrossThreadFulfiller() {
+  kj::Own<_::XThreadPafImpl<T>> node(new _::XThreadPafImpl<T>, _::XThreadPaf::DISPOSER);
+  auto fulfiller = kj::heap<_::XThreadFulfiller<T>>(node);
+  return { _::PromiseNode::to<_::ReducePromises<T>>(kj::mv(node)), kj::mv(fulfiller) };
 }
 
 }  // namespace kj

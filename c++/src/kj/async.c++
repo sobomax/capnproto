@@ -46,6 +46,7 @@
 #include "mutex.h"
 #include "one-of.h"
 #include "function.h"
+#include "list.h"
 #include <deque>
 
 #if _WIN32 || __CYGWIN__
@@ -71,6 +72,28 @@
 #endif
 
 #include <stdlib.h>
+
+#if _MSC_VER && !__clang__
+// MSVC's atomic intrinsics are weird and different, whereas the C++ standard atomics match the GCC
+// builtins -- except for requiring the obnoxious std::atomic<T> wrapper. So, on MSVC let's just
+// #define the builtins based on the C++ library, reinterpret-casting native types to
+// std::atomic... this is cheating but ugh, whatever.
+#include <atomic>
+template <typename T>
+static std::atomic<T>* reinterpretAtomic(T* ptr) { return reinterpret_cast<std::atomic<T>*>(ptr); }
+#define __atomic_store_n(ptr, val, order) \
+    std::atomic_store_explicit(reinterpretAtomic(ptr), val, order)
+#define __atomic_load_n(ptr, order) \
+    std::atomic_load_explicit(reinterpretAtomic(ptr), order)
+#define __atomic_compare_exchange_n(ptr, expected, desired, weak, succ, fail) \
+    std::atomic_compare_exchange_strong_explicit( \
+        reinterpretAtomic(ptr), expected, desired, succ, fail)
+#define __atomic_exchange_n(ptr, val, order) \
+    std::atomic_exchange_explicit(reinterpretAtomic(ptr), val, order)
+#define __ATOMIC_RELAXED std::memory_order_relaxed
+#define __ATOMIC_ACQUIRE std::memory_order_acquire
+#define __ATOMIC_RELEASE std::memory_order_release
+#endif
 
 namespace kj {
 
@@ -154,12 +177,22 @@ public:
 
 // =======================================================================================
 
+void END_CANCELER_STACK_START_CANCELEE_STACK() {}
+// Dummy symbol used when reporting how a Canceler was canceled. We end up combining two stack
+// traces into one and we use this as a separator.
+
 Canceler::~Canceler() noexcept(false) {
-  cancel("operation canceled");
+  if (isEmpty()) return;
+  cancel(getDestructionReason(
+      reinterpret_cast<void*>(&END_CANCELER_STACK_START_CANCELEE_STACK),
+      Exception::Type::DISCONNECTED, __FILE__, __LINE__, "operation canceled"_kj));
 }
 
 void Canceler::cancel(StringPtr cancelReason) {
   if (isEmpty()) return;
+  // We can't use getDestructionReason() here because if an exception is in-flight, it would use
+  // that exception, totally discarding the reason given by the caller. This would probably be
+  // unexpected. The caller can always use getDestructionReason() themselves if desired.
   cancel(Exception(Exception::Type::DISCONNECTED, __FILE__, __LINE__, kj::str(cancelReason)));
 }
 
@@ -226,23 +259,22 @@ void Canceler::AdapterImpl<void>::cancel(kj::Exception&& e) {
 
 TaskSet::TaskSet(TaskSet::ErrorHandler& errorHandler)
   : errorHandler(errorHandler) {}
-
-TaskSet::~TaskSet() noexcept(false) {
-  // You could argue it is dubious, but some applications would like for the destructor of a
-  // task to be able to schedule new tasks. So when we cancel our tasks... we might find new
-  // tasks added! We'll have to repeatedly cancel.
-  while (tasks != nullptr) {
-    auto toDestroy = kj::mv(tasks);
-    tasks = nullptr;
-  }
-}
-
 class TaskSet::Task final: public _::Event {
 public:
   Task(TaskSet& taskSet, Own<_::PromiseNode>&& nodeParam)
       : taskSet(taskSet), node(kj::mv(nodeParam)) {
     node->setSelfPointer(&node);
     node->onReady(this);
+  }
+
+  Own<Task> pop() {
+    KJ_IF_MAYBE(n, next) { n->get()->prev = prev; }
+    Own<Task> self = kj::mv(KJ_ASSERT_NONNULL(*prev));
+    KJ_ASSERT(self.get() == this);
+    *prev = kj::mv(next);
+    next = nullptr;
+    prev = nullptr;
+    return self;
   }
 
   Maybe<Own<Task>> next;
@@ -274,14 +306,7 @@ protected:
     }
 
     // Remove from the task list.
-    KJ_IF_MAYBE(n, next) {
-      n->get()->prev = prev;
-    }
-    Own<Event> self = kj::mv(KJ_ASSERT_NONNULL(*prev));
-    KJ_ASSERT(self.get() == this);
-    *prev = kj::mv(next);
-    next = nullptr;
-    prev = nullptr;
+    auto self = pop();
 
     KJ_IF_MAYBE(f, taskSet.emptyFulfiller) {
       if (taskSet.tasks == nullptr) {
@@ -303,6 +328,16 @@ private:
   TaskSet& taskSet;
   Own<_::PromiseNode> node;
 };
+
+TaskSet::~TaskSet() noexcept(false) {
+  // You could argue it is dubious, but some applications would like for the destructor of a
+  // task to be able to schedule new tasks. So when we cancel our tasks... we might find new
+  // tasks added! We'll have to repeatedly cancel. Additionally, we need to make sure that we destroy
+  // the items in a loop to prevent any issues with stack overflow.
+  while (tasks != nullptr) {
+    auto removed = KJ_REQUIRE_NONNULL(tasks)->pop();
+  }
+}
 
 void TaskSet::add(Promise<void>&& promise) {
   auto task = heap<Task>(*this, _::PromiseNode::from(kj::mv(promise)));
@@ -421,7 +456,7 @@ private:
   Impl* impl;
 #endif
 
-  void run();
+  [[noreturn]] void run();
 
   bool isReset() { return main == nullptr; }
 };
@@ -456,6 +491,13 @@ public:
       }
     }
 #endif
+
+    // Make sure we're not leaking anything from the global freelist either.
+    auto lock = freelist.lockExclusive();
+    auto dangling = kj::mv(*lock);
+    for (auto& stack: dangling) {
+      delete stack;
+    }
   }
 
   void setMaxFreelist(size_t count) {
@@ -647,53 +689,6 @@ LoggingErrorHandler LoggingErrorHandler::instance = LoggingErrorHandler();
 struct Executor::Impl {
   Impl(EventLoop& loop): state(loop) {}
 
-  typedef Maybe<_::XThreadEvent&> _::XThreadEvent::*NextMember;
-  typedef Maybe<_::XThreadEvent&>* _::XThreadEvent::*PrevMember;
-
-  template <NextMember next, PrevMember prev>
-  struct List {
-    kj::Maybe<_::XThreadEvent&> head;
-    kj::Maybe<_::XThreadEvent&>* tail = &head;
-
-    bool empty() const {
-      return head == nullptr;
-    }
-
-    void insert(_::XThreadEvent& event) {
-      KJ_REQUIRE(event.*prev == nullptr);
-      *tail = event;
-      event.*prev = tail;
-      tail = &(event.*next);
-    }
-
-    void erase(_::XThreadEvent& event) {
-      KJ_REQUIRE(event.*prev != nullptr);
-      *(event.*prev) = event.*next;
-      KJ_IF_MAYBE(n, event.*next) {
-        n->*prev = event.*prev;
-      } else {
-        KJ_DASSERT(tail == &(event.*next));
-        tail = event.*prev;
-      }
-      event.*next = nullptr;
-      event.*prev = nullptr;
-    }
-
-    template <typename Func>
-    void forEach(Func&& func) {
-      kj::Maybe<_::XThreadEvent&> current = head;
-      for (;;) {
-        KJ_IF_MAYBE(c, current) {
-          auto nextItem = c->*next;
-          func(*c);
-          current = nextItem;
-        } else {
-          break;
-        }
-      }
-    }
-  };
-
   struct State {
     // Queues of notifications from other threads that need this thread's attention.
 
@@ -702,14 +697,17 @@ struct Executor::Impl {
     kj::Maybe<EventLoop&> loop;
     // Becomes null when the loop is destroyed.
 
-    List<&_::XThreadEvent::targetNext, &_::XThreadEvent::targetPrev> start;
-    List<&_::XThreadEvent::targetNext, &_::XThreadEvent::targetPrev> cancel;
-    List<&_::XThreadEvent::replyNext, &_::XThreadEvent::replyPrev> replies;
+    List<_::XThreadEvent, &_::XThreadEvent::targetLink> start;
+    List<_::XThreadEvent, &_::XThreadEvent::targetLink> cancel;
+    List<_::XThreadEvent, &_::XThreadEvent::replyLink> replies;
     // Lists of events that need actioning by this thread.
 
-    List<&_::XThreadEvent::targetNext, &_::XThreadEvent::targetPrev> executing;
+    List<_::XThreadEvent, &_::XThreadEvent::targetLink> executing;
     // Events that have already been dispatched and are happily executing. This list is maintained
     // so that they can be canceled if the event loop exits.
+
+    List<_::XThreadPaf, &_::XThreadPaf::link> fulfilled;
+    // Set of XThreadPafs that have been fulfilled by another thread.
 
     bool waitingForCancel = false;
     // True if this thread is currently blocked waiting for some other thread to pump its
@@ -717,28 +715,34 @@ struct Executor::Impl {
     // deadlock -- it must take precautions against this.
 
     bool isDispatchNeeded() const {
-      return !start.empty() || !cancel.empty() || !replies.empty();
+      return !start.empty() || !cancel.empty() || !replies.empty() || !fulfilled.empty();
     }
 
     void dispatchAll(Vector<_::XThreadEvent*>& eventsToCancelOutsideLock) {
-      start.forEach([&](_::XThreadEvent& event) {
-        start.erase(event);
-        executing.insert(event);
+      for (auto& event: start) {
+        start.remove(event);
+        executing.add(event);
         event.state = _::XThreadEvent::EXECUTING;
         event.armBreadthFirst();
-      });
+      }
 
       dispatchCancels(eventsToCancelOutsideLock);
 
-      replies.forEach([&](_::XThreadEvent& event) {
-        replies.erase(event);
+      for (auto& event: replies) {
+        replies.remove(event);
         event.onReadyEvent.armBreadthFirst();
-      });
+      }
+
+      for (auto& event: fulfilled) {
+        fulfilled.remove(event);
+        event.state = _::XThreadPaf::DISPATCHED;
+        event.onReadyEvent.armBreadthFirst();
+      }
     }
 
     void dispatchCancels(Vector<_::XThreadEvent*>& eventsToCancelOutsideLock) {
-      cancel.forEach([&](_::XThreadEvent& event) {
-        cancel.erase(event);
+      for (auto& event: cancel) {
+        cancel.remove(event);
 
         if (event.promiseNode == nullptr) {
           event.setDoneState();
@@ -748,7 +752,7 @@ struct Executor::Impl {
           // cancellation. So we have to add it to a list to destroy later.
           eventsToCancelOutsideLock.add(&event);
         }
-      });
+      }
     }
   };
 
@@ -788,37 +792,46 @@ struct Executor::Impl {
     // a conditional wait for state changes gets a chance to have their wait condition re-checked.
     KJ_DEFER(state.lockExclusive());
 
-    s.start.forEach([&](_::XThreadEvent& event) {
+    for (auto& event: s.start) {
       KJ_ASSERT(event.state == _::XThreadEvent::QUEUED, event.state) { break; }
-      s.start.erase(event);
+      s.start.remove(event);
       event.setDisconnected();
       event.sendReply();
       event.setDoneState();
-    });
+    }
 
-    s.executing.forEach([&](_::XThreadEvent& event) {
+    for (auto& event: s.executing) {
       KJ_ASSERT(event.state == _::XThreadEvent::EXECUTING, event.state) { break; }
-      s.executing.erase(event);
+      s.executing.remove(event);
       event.promiseNode = nullptr;
       event.setDisconnected();
       event.sendReply();
       event.setDoneState();
-    });
+    }
 
-    s.cancel.forEach([&](_::XThreadEvent& event) {
+    for (auto& event: s.cancel) {
       KJ_ASSERT(event.state == _::XThreadEvent::CANCELING, event.state) { break; }
-      s.cancel.erase(event);
+      s.cancel.remove(event);
       event.promiseNode = nullptr;
       event.setDoneState();
-    });
+    }
 
     // The replies list "should" be empty, because any locally-initiated tasks should have been
     // canceled before destroying the EventLoop.
     if (!s.replies.empty()) {
       KJ_LOG(ERROR, "EventLoop destroyed with cross-thread event replies outstanding");
-      s.replies.forEach([&](_::XThreadEvent& event) {
-        s.replies.erase(event);
-      });
+      for (auto& event: s.replies) {
+        s.replies.remove(event);
+      }
+    }
+
+    // Similarly for cross-thread fulfillers. The waiting tasks should have been canceled.
+    if (!s.fulfilled.empty()) {
+      KJ_LOG(ERROR, "EventLoop destroyed with cross-thread fulfiller replies outstanding");
+      for (auto& event: s.fulfilled) {
+        s.fulfilled.remove(event);
+        event.state = _::XThreadPaf::DISPATCHED;
+      }
     }
   }};
 
@@ -835,11 +848,7 @@ void XThreadEvent::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
 }
 
 void XThreadEvent::ensureDoneOrCanceled() {
-#if _MSC_VER && !defined(__clang__)
-  {  // TODO(perf): TODO(msvc): Implement the double-checked lock optimization on MSVC.
-#else
   if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != DONE) {
-#endif
     auto lock = targetExecutor->impl->state.lockExclusive();
 
     const EventLoop* loop;
@@ -857,13 +866,13 @@ void XThreadEvent::ensureDoneOrCanceled() {
         // Nothing to do.
         break;
       case QUEUED:
-        lock->start.erase(*this);
+        lock->start.remove(*this);
         // No wake needed since we removed work rather than adding it.
         state = DONE;
         break;
       case EXECUTING: {
-        lock->executing.erase(*this);
-        lock->cancel.insert(*this);
+        lock->executing.remove(*this);
+        lock->cancel.add(*this);
         state = CANCELING;
         KJ_IF_MAYBE(p, loop->port) {
           p->wake();
@@ -955,7 +964,7 @@ void XThreadEvent::ensureDoneOrCanceled() {
           //   synchronous execution, which means there's no way to cancel it.
           lock.wait([&](auto&) { return state == DONE; });
         }
-        KJ_DASSERT(targetPrev == nullptr);
+        KJ_DASSERT(!targetLink.isLinked());
         break;
       }
       case CANCELING:
@@ -970,9 +979,9 @@ void XThreadEvent::ensureDoneOrCanceled() {
     // Since we know we reached the DONE state (or never left UNUSED), we know that the remote
     // thread is all done playing with our `replyPrev` pointer. Only the current thread could
     // possibly modify it after this point. So we can skip the lock if it's already null.
-    if (replyPrev != nullptr) {
+    if (replyLink.isLinked()) {
       auto lock = e->impl->state.lockExclusive();
-      lock->replies.erase(*this);
+      lock->replies.remove(*this);
     }
   }
 }
@@ -984,7 +993,7 @@ void XThreadEvent::sendReply() {
     {
       auto lock = e->impl->state.lockExclusive();
       KJ_IF_MAYBE(l, lock->loop) {
-        lock->replies.insert(*this);
+        lock->replies.add(*this);
         replyLoop = l;
       } else {
         // Calling thread exited without cancelling the promise. This is UB. In fact,
@@ -1020,12 +1029,12 @@ void XThreadEvent::done() {
 
     switch (state) {
       case EXECUTING:
-        lock->executing.erase(*this);
+        lock->executing.remove(*this);
         break;
       case CANCELING:
         // Sending thread requested cancelation, but we're done anyway, so it doesn't matter at this
         // point.
-        lock->cancel.erase(*this);
+        lock->cancel.remove(*this);
         break;
       default:
         KJ_FAIL_ASSERT("can't call done() from this state", (uint)state);
@@ -1036,12 +1045,7 @@ void XThreadEvent::done() {
 }
 
 inline void XThreadEvent::setDoneState() {
-#if _MSC_VER && !defined(__clang__)
-  // TODO(perf): TODO(msvc): Implement the double-checked lock optimization on MSVC.
-  state = DONE;
-#else
   __atomic_store_n(&state, DONE, __ATOMIC_RELEASE);
-#endif
 }
 
 void XThreadEvent::setDisconnected() {
@@ -1106,6 +1110,97 @@ void XThreadEvent::onReady(Event* event) noexcept {
   onReadyEvent.init(event);
 }
 
+XThreadPaf::XThreadPaf()
+    : state(WAITING), executor(getCurrentThreadExecutor()) {}
+XThreadPaf::~XThreadPaf() noexcept(false) {}
+
+void XThreadPaf::Disposer::disposeImpl(void* pointer) const {
+  XThreadPaf* obj = reinterpret_cast<XThreadPaf*>(pointer);
+  auto oldState = WAITING;
+
+  if (__atomic_load_n(&obj->state, __ATOMIC_ACQUIRE) == DISPATCHED) {
+    // Common case: Promise was fully fulfilled and dispatched, no need for locking.
+    delete obj;
+  } else if (__atomic_compare_exchange_n(&obj->state, &oldState, CANCELED, false,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+    // State transitioned from WAITING to CANCELED, so now it's the fulfiller's job to destroy the
+    // object.
+  } else {
+    // Whoops, another thread is already in the process of fulfilling this promise. We'll have to
+    // wait for it to finish and transition the state to FULFILLED.
+    obj->executor.impl->state.when([&](auto&) {
+      return obj->state == FULFILLED || obj->state == DISPATCHED;
+    }, [&](Executor::Impl::State& exState) {
+      if (obj->state == FULFILLED) {
+        // The object is on the queue but was not yet dispatched. Remove it.
+        exState.fulfilled.remove(*obj);
+      }
+    });
+
+    // It's ours now, delete it.
+    delete obj;
+  }
+}
+
+const XThreadPaf::Disposer XThreadPaf::DISPOSER;
+
+void XThreadPaf::onReady(Event* event) noexcept {
+  onReadyEvent.init(event);
+}
+
+void XThreadPaf::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
+  // We can't safely trace into another thread, so we'll stop here.
+  // Maybe returning the address of get() will give us a function name with meaningful type
+  // information.
+  builder.add(getMethodStartAddress(implicitCast<PromiseNode&>(*this), &PromiseNode::get));
+}
+
+XThreadPaf::FulfillScope::FulfillScope(XThreadPaf** pointer) {
+  obj = __atomic_exchange_n(pointer, static_cast<XThreadPaf*>(nullptr), __ATOMIC_ACQUIRE);
+  auto oldState = WAITING;
+  if (obj == nullptr) {
+    // Already fulfilled (possibly by another thread).
+  } else if (__atomic_compare_exchange_n(&obj->state, &oldState, FULFILLING, false,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+    // Transitioned to FULFILLING, good.
+  } else {
+    // The waiting thread must have canceled.
+    KJ_ASSERT(oldState == CANCELED);
+
+    // It's our responsibility to clean up, then.
+    delete obj;
+
+    // Set `obj` null so that we don't try to fill it in or delete it later.
+    obj = nullptr;
+  }
+}
+XThreadPaf::FulfillScope::~FulfillScope() noexcept(false) {
+  if (obj != nullptr) {
+    auto lock = obj->executor.impl->state.lockExclusive();
+    KJ_IF_MAYBE(l, lock->loop) {
+      lock->fulfilled.add(*obj);
+      __atomic_store_n(&obj->state, FULFILLED, __ATOMIC_RELEASE);
+      KJ_IF_MAYBE(p, l->port) {
+        // TODO(perf): It's annoying we have to call wake() with the lock held, but we have to
+        //   prevent the destination EventLoop from being destroyed first.
+        p->wake();
+      }
+    } else {
+      KJ_LOG(FATAL,
+          "the thread which called kj::newPromiseAndCrossThreadFulfiller<T>() apparently exited "
+          "its own event loop without canceling the cross-thread promise first; this is "
+          "undefined behavior so I will crash now");
+      abort();
+    }
+  }
+}
+
+kj::Exception XThreadPaf::unfulfilledException() {
+  // TODO(cleanup): Share code with regular PromiseAndFulfiller for stack tracing here.
+  return kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::heapString(
+      "cross-thread PromiseFulfiller was destroyed without fulfilling the promise."));
+}
+
 class ExecutorImpl: public Executor, public AtomicRefcounted {
 public:
   using Executor::Executor;
@@ -1160,7 +1255,7 @@ void Executor::send(_::XThreadEvent& event, bool sync) const {
   }
 
   event.state = _::XThreadEvent::QUEUED;
-  lock->start.insert(event);
+  lock->start.add(event);
 
   KJ_IF_MAYBE(p, loop->port) {
     p->wake();
@@ -1296,7 +1391,7 @@ struct FiberStack::StartRoutine {
     reinterpret_cast<FiberStack*>(ptr)->run();
   }
 #else
-  static void run(int arg1, int arg2) {
+  [[noreturn]] static void run(int arg1, int arg2) {
     // This is the static C-style function we pass to makeContext().
 
     // POSIX says the arguments are ints, not pointers. So we split our pointer in half in order to
@@ -1536,8 +1631,11 @@ EventLoop::EventLoop(EventPort& port)
       daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {}
 
 EventLoop::~EventLoop() noexcept(false) {
-  // Destroy all "daemon" tasks, noting that their destructors might try to access the EventLoop
-  // some more.
+  // Destroy all "daemon" tasks, noting that their destructors might register more daemon tasks.
+  while (!daemons->isEmpty()) {
+    auto oldDaemons = kj::mv(daemons);
+    daemons = kj::heap<TaskSet>(_::LoggingErrorHandler::instance);
+  }
   daemons = nullptr;
 
   KJ_IF_MAYBE(e, executor) {
@@ -2230,6 +2328,10 @@ Maybe<Own<Event>> ForkHubBase::fire() {
 }
 
 void ForkHubBase::traceEvent(TraceBuilder& builder) {
+  if (inner.get() != nullptr) {
+    inner->tracePromise(builder, true);
+  }
+
   if (headBranch != nullptr) {
     // We'll trace down the first branch, I guess.
     headBranch->onReadyEvent.traceEvent(builder);
@@ -2589,34 +2691,20 @@ void WeakFulfillerBase::disposeImpl(void* pointer) const {
     if (inner->isWaiting()) {
       // Let's find out if there's an exception being thrown. If so, we'll use it to reject the
       // promise.
-#if !KJ_NO_EXCEPTIONS
-      InFlightExceptionIterator iter;
-      KJ_IF_MAYBE(e, iter.next()) {
-        auto copy = kj::cp(*e);
-        copy.truncateCommonTrace();
-        inner->reject(kj::mv(copy));
-      } else {
-#endif
-        // Darn, use a generic exception.
-        kj::Exception exception(kj::Exception::Type::FAILED, __FILE__, __LINE__,
-            kj::heapString("PromiseFulfiller was destroyed without fulfilling the promise."));
-
-        // Let's give some context on where the PromiseFulfiller was destroyed.
-        exception.extendTrace(1, 16);
-
-        // Add a separator that hopefully makes this understandable...
-        exception.addTrace(reinterpret_cast<void*>(&END_FULFILLER_STACK_START_LISTENER_STACK));
-
-        inner->reject(kj::mv(exception));
-#if !KJ_NO_EXCEPTIONS
-      }
-#endif
+      inner->reject(getDestructionReason(
+          reinterpret_cast<void*>(&END_FULFILLER_STACK_START_LISTENER_STACK),
+          kj::Exception::Type::FAILED, __FILE__, __LINE__,
+          "PromiseFulfiller was destroyed without fulfilling the promise."_kj));
     }
     inner = nullptr;
   }
 }
 
+}  // namespace _ (private)
+
 // -------------------------------------------------------------------
+
+namespace _ {  // (private)
 
 Promise<void> IdentityFunc<Promise<void>>::operator()() const { return READY_NOW; }
 

@@ -43,6 +43,7 @@ class AutoCloseFd;
 class NetworkAddress;
 class AsyncOutputStream;
 class AsyncIoStream;
+class AncillaryMessage;
 
 // =======================================================================================
 // Streaming I/O
@@ -84,6 +85,21 @@ public:
   //
   // To prevent runaway memory allocation, consider using a more conservative value for `limit` than
   // the default, particularly on untrusted data streams which may never see EOF.
+
+  virtual void registerAncillaryMessageHandler(Function<void(ArrayPtr<AncillaryMessage>)> fn);
+  // Register interest in checking for ancillary messages (aka control messages) when reading.
+  // The provided callback will be called whenever any are encountered. The messages passed to
+  // the function do not live beyond when function returns.
+  // Only supported on Unix (the default impl throws UNIMPLEMENTED). Most apps will not use this.
+
+  virtual Maybe<Own<AsyncInputStream>> tryTee(uint64_t limit = kj::maxValue);
+  // Primarily intended as an optimization for the `tee` call. Returns an input stream whose state
+  // is independent from this one but which will return the exact same set of bytes read going
+  // forward. limit is a total limit on the amount of memory, in bytes, which a tee implementation
+  // may use to buffer stream data. An implementation must throw an exception if a read operation
+  // would cause the limit to be exceeded. If tryTee() can see that the new limit is impossible to
+  // satisfy, it should return nullptr so that the pessimized path is taken in newTee. This is
+  // likely to arise if tryTee() is called twice with different limits on the same stream.
 };
 
 class AsyncOutputStream {
@@ -146,10 +162,14 @@ public:
   // Note that we don't provide methods that return NetworkAddress because it usually wouldn't
   // be useful. You can't connect() to or listen() on these addresses, obviously, because they are
   // ephemeral addresses for a single connection.
+
+  virtual kj::Maybe<int> getFd() const { return nullptr; }
+  // Get the underlying Unix file descriptor, if any. Returns nullptr if this object actually
+  // isn't wrapping a file descriptor.
 };
 
 class AsyncCapabilityStream: public AsyncIoStream {
-  // An AsyncIoStream that also allows transmitting new stream objects and file descirptors
+  // An AsyncIoStream that also allows transmitting new stream objects and file descriptors
   // (capabilities, in the object-capability model sense), in addition to bytes.
   //
   // Capabilities can be attached to bytes when they are written. On the receiving end, the read()
@@ -158,7 +178,7 @@ class AsyncCapabilityStream: public AsyncIoStream {
   // Note that AsyncIoStream's regular byte-oriented methods can be used on AsyncCapabilityStream,
   // with the effect of silently dropping any capabilities attached to the respective bytes. E.g.
   // using `AsyncIoStream::tryRead()` to read bytes that had been sent with `writeWithFds()` will
-  // silently drop the FDs (closing them if appropriate). Also note that puming a stream with
+  // silently drop the FDs (closing them if appropriate). Also note that pumping a stream with
   // `pumpTo()` always drops all capabilities attached to the pumped data. (TODO(someday): Do we
   // want a version of pumpTo() that preserves capabilities?)
   //
@@ -437,14 +457,14 @@ public:
   // Protocol-specific message type.
 
   template <typename T>
-  inline Maybe<const T&> as();
+  inline Maybe<const T&> as() const;
   // Interpret the ancillary message as the given struct type. Most ancillary messages are some
   // sort of struct, so this is a convenient way to access it. Returns nullptr if the message
   // is smaller than the struct -- this can happen if the message was truncated due to
   // insufficient ancillary buffer space.
 
   template <typename T>
-  inline ArrayPtr<const T> asArray();
+  inline ArrayPtr<const T> asArray() const;
   // Interpret the ancillary message as an array of items. If the message size does not evenly
   // divide into elements of type T, the remainder is discarded -- this can happen if the message
   // was truncated due to insufficient ancillary buffer space.
@@ -479,7 +499,7 @@ public:
   // Get the content of the datagram.
 
   virtual MaybeTruncated<ArrayPtr<const AncillaryMessage>> getAncillary() = 0;
-  // Ancilarry messages received with the datagram. See the recvmsg() system call and the cmsghdr
+  // Ancillary messages received with the datagram. See the recvmsg() system call and the cmsghdr
   // struct. Most apps don't need this.
   //
   // If the returned value is truncated, then the last message in the array may itself be
@@ -972,7 +992,7 @@ inline int AncillaryMessage::getLevel() const { return level; }
 inline int AncillaryMessage::getType() const { return type; }
 
 template <typename T>
-inline Maybe<const T&> AncillaryMessage::as() {
+inline Maybe<const T&> AncillaryMessage::as() const {
   if (data.size() >= sizeof(T)) {
     return *reinterpret_cast<const T*>(data.begin());
   } else {
@@ -981,7 +1001,7 @@ inline Maybe<const T&> AncillaryMessage::as() {
 }
 
 template <typename T>
-inline ArrayPtr<const T> AncillaryMessage::asArray() {
+inline ArrayPtr<const T> AncillaryMessage::asArray() const {
   return arrayPtr(reinterpret_cast<const T*>(data.begin()), data.size() / sizeof(T));
 }
 

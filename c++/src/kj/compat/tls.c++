@@ -22,16 +22,19 @@
 #if KJ_HAS_OPENSSL
 
 #include "tls.h"
+
 #include "readiness-io.h"
+
 #include <openssl/bio.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/evp.h>
 #include <openssl/conf.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
+#include <kj/async-queue.h>
 #include <kj/debug.h>
 #include <kj/vector.h>
 
@@ -160,11 +163,20 @@ public:
       }
     });
   }
+
   kj::Promise<void> accept() {
     // We are the server. Set SSL options to prefer server's cipher choice.
     SSL_set_options(ssl, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
-    return sslCall([this]() { return SSL_accept(ssl); }).ignoreResult();
+    auto acceptPromise = sslCall([this]() {
+      return SSL_accept(ssl);
+    });
+    return acceptPromise.then([](size_t ret) {
+      if (ret == 0) {
+        kj::throwRecoverableException(
+            KJ_EXCEPTION(DISCONNECTED, "Client disconnected during SSL_accept()"));
+      }
+    });
   }
 
   kj::Own<TlsPeerIdentity> getIdentity(kj::Own<kj::PeerIdentity> inner) {
@@ -196,7 +208,7 @@ public:
   void shutdownWrite() override {
     KJ_REQUIRE(shutdownTask == nullptr, "already called shutdownWrite()");
 
-    // TODO(0.9): shutdownWrite() is problematic because it doesn't return a promise. It was
+    // TODO(0.10): shutdownWrite() is problematic because it doesn't return a promise. It was
     //   designed to assume that it would only be called after all writes are finished and that
     //   there was no reason to block at that point, but SSL sessions don't fit this since they
     //   actually have to send a shutdown message.
@@ -225,6 +237,10 @@ public:
   }
   void getpeername(struct sockaddr* addr, uint* length) override {
     inner.getpeername(addr, length);
+  }
+
+  kj::Maybe<int> getFd() const override {
+    return inner.getFd();
   }
 
 private:
@@ -311,7 +327,7 @@ private:
             // According to documentation we shouldn't get here, because our BIO never returns an
             // "error". But in practice we do get here sometimes when the peer disconnects
             // prematurely.
-            KJ_FAIL_ASSERT("TLS protocol error");
+            return KJ_EXCEPTION(DISCONNECTED, "SSL unable to continue I/O");
           }
         default:
           KJ_FAIL_ASSERT("unexpected SSL error code", error);
@@ -401,21 +417,37 @@ private:
 // =======================================================================================
 // Implementations of ConnectionReceiver, NetworkAddress, and Network as wrappers adding TLS.
 
-class TlsConnectionReceiver final: public kj::ConnectionReceiver {
+class TlsConnectionReceiver final: public ConnectionReceiver, public TaskSet::ErrorHandler {
 public:
-  TlsConnectionReceiver(TlsContext& tls, kj::Own<kj::ConnectionReceiver> inner)
-      : tls(tls), inner(kj::mv(inner)) {}
+  TlsConnectionReceiver(TlsContext &tls, Own<ConnectionReceiver> inner)
+      : tls(tls), inner(kj::mv(inner)),
+        acceptLoopTask(acceptLoop().eagerlyEvaluate([this](Exception &&e) {
+          onAcceptFailure(kj::mv(e));
+        })),
+        tasks(*this) {}
+
+  void taskFailed(Exception&& e) override {
+    // TODO(someday): SSL connection failures may be a fact of normal operation but they may also
+    // be important diagnostic information. We should allow for an error handler to be passed in so
+    // that network issues that affect TLS can be more discoverable from the server side.
+    if (e.getType() != Exception::Type::DISCONNECTED) {
+      KJ_LOG(ERROR, "error accepting tls connection", kj::mv(e));
+    }
+  };
 
   Promise<Own<AsyncIoStream>> accept() override {
-    return inner->accept().then([this](kj::Own<AsyncIoStream> stream) {
-      return tls.wrapServer(kj::mv(stream));
+    return acceptAuthenticated().then([](AuthenticatedStream&& stream) {
+      return kj::mv(stream.stream);
     });
   }
 
-  Promise<kj::AuthenticatedStream> acceptAuthenticated() override {
-    return inner->acceptAuthenticated().then([this](kj::AuthenticatedStream stream) {
-      return tls.wrapServer(kj::mv(stream));
-    });
+  Promise<AuthenticatedStream> acceptAuthenticated() override {
+    KJ_IF_MAYBE(e, maybeInnerException) {
+      // We've experienced an exception from the inner receiver, we consider this unrecoverable.
+      return Exception(*e);
+    }
+
+    return queue.pop();
   }
 
   uint getPort() override {
@@ -431,8 +463,50 @@ public:
   }
 
 private:
+  void onAcceptSuccess(AuthenticatedStream&& stream) {
+    // Queue this stream to go through SSL_accept.
+
+    auto acceptPromise = kj::evalNow([&] {
+      // Do the SSL acceptance procedure.
+      return tls.wrapServer(kj::mv(stream));
+    });
+
+    auto sslPromise = acceptPromise.then([this](auto&& stream) -> Promise<void> {
+      // This is only attached to the success path, thus the error handler will catch if our
+      // promise fails.
+      queue.push(kj::mv(stream));
+      return kj::READY_NOW;
+    });
+    tasks.add(kj::mv(sslPromise));
+  }
+
+  void onAcceptFailure(Exception&& e) {
+    // Store this exception to reject all future calls to accept() and reject any unfulfilled
+    // promises from the queue.
+    maybeInnerException = kj::mv(e);
+    queue.rejectAll(Exception(KJ_REQUIRE_NONNULL(maybeInnerException)));
+  }
+
+  Promise<void> acceptLoop() {
+    // Accept one connection and queue up the next accept on our TaskSet.
+
+    return inner->acceptAuthenticated().then(
+        [this](AuthenticatedStream&& stream) {
+      onAcceptSuccess(kj::mv(stream));
+
+      // Queue up the next accept loop immediately without waiting for SSL_accept()/wrapServer().
+      return acceptLoop();
+    });
+  }
+
   TlsContext& tls;
-  kj::Own<kj::ConnectionReceiver> inner;
+  Own<ConnectionReceiver> inner;
+
+  Promise<void> acceptLoopTask;
+  ProducerConsumerQueue<AuthenticatedStream> queue;
+  TaskSet tasks;
+
+  Maybe<Exception> maybeInnerException;
 };
 
 class TlsNetworkAddress final: public kj::NetworkAddress {
@@ -632,6 +706,12 @@ TlsContext::TlsContext(Options options) {
     SSL_CTX_set_tlsext_servername_arg(ctx, sni);
   }
 
+  KJ_IF_MAYBE(timeout, options.acceptTimeout) {
+    this->timer = KJ_REQUIRE_NONNULL(options.timer,
+        "acceptTimeout option requires that a timer is also provided");
+    this->acceptTimeout = *timeout;
+  }
+
   this->ctx = ctx;
 }
 
@@ -695,6 +775,9 @@ kj::Promise<kj::Own<kj::AsyncIoStream>> TlsContext::wrapClient(
 kj::Promise<kj::Own<kj::AsyncIoStream>> TlsContext::wrapServer(kj::Own<kj::AsyncIoStream> stream) {
   auto conn = kj::heap<TlsConnection>(kj::mv(stream), reinterpret_cast<SSL_CTX*>(ctx));
   auto promise = conn->accept();
+  KJ_IF_MAYBE(timeout, acceptTimeout) {
+    promise = KJ_REQUIRE_NONNULL(timer).timeoutAfter(*timeout, kj::mv(promise));
+  }
   return promise.then(kj::mvCapture(conn, [](kj::Own<TlsConnection> conn)
       -> kj::Own<kj::AsyncIoStream> {
     return kj::mv(conn);
@@ -714,6 +797,9 @@ kj::Promise<kj::AuthenticatedStream> TlsContext::wrapClient(
 kj::Promise<kj::AuthenticatedStream> TlsContext::wrapServer(kj::AuthenticatedStream stream) {
   auto conn = kj::heap<TlsConnection>(kj::mv(stream.stream), reinterpret_cast<SSL_CTX*>(ctx));
   auto promise = conn->accept();
+  KJ_IF_MAYBE(timeout, acceptTimeout) {
+    promise = KJ_REQUIRE_NONNULL(timer).timeoutAfter(*timeout, kj::mv(promise));
+  }
   return promise.then([conn=kj::mv(conn),innerId=kj::mv(stream.peerIdentity)]() mutable {
     auto id = conn->getIdentity(kj::mv(innerId));
     return kj::AuthenticatedStream { kj::mv(conn), kj::mv(id) };

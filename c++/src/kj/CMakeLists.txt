@@ -3,14 +3,15 @@
 
 set(kj_sources_lite
   array.c++
+  list.c++
   common.c++
   debug.c++
   exception.c++
   io.c++
   memory.c++
-  miniposix.c++
   mutex.c++
   string.c++
+  source-location.c++
   hash.c++
   table.c++
   thread.c++
@@ -41,9 +42,11 @@ set(kj_headers
   memory.h
   refcount.h
   array.h
+  list.h
   vector.h
   string.h
   string-tree.h
+  source-location.h
   hash.h
   table.h
   map.h
@@ -126,6 +129,7 @@ set(kj-async_headers
   async-unix.h
   async-win32.h
   async-io.h
+  async-queue.h
   timer.h
 )
 if(NOT CAPNP_LITE)
@@ -219,6 +223,7 @@ if(BUILD_TESTING)
     common-test.c++
     memory-test.c++
     array-test.c++
+    list-test.c++
     string-test.c++
     table-test.c++
     map-test.c++
@@ -245,6 +250,7 @@ if(BUILD_TESTING)
       async-win32-test.c++
       async-win32-xthread-test.c++
       async-io-test.c++
+      async-queue-test.c++
       refcount-test.c++
       string-tree-test.c++
       encoding-test.c++

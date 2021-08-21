@@ -1,4 +1,4 @@
-// Copyright (c) 2013-2014 Sandstorm Development Group, Inc. and contributors
+// Copyright (c) 2021 Cloudflare, Inc. and contributors
 // Licensed under the MIT License:
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -19,31 +19,28 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#include "miniposix.h"
+#include "list.h"
+#include "debug.h"
 
 namespace kj {
-namespace miniposix {
-#if !defined(_WIN32) && !defined(IOV_MAX) && !defined(UIO_MAX_IOV)
-size_t iovMax() {
-  // Thread-safe & lazily initialized only on first use.
-  static const size_t KJ_IOV_MAX = [] () -> size_t {
-    long iovmax;
+namespace _ {
 
-    errno = 0;
-    iovmax = sysconf(_SC_IOV_MAX);
-    if (iovmax == -1) {
-      if (errno == 0) {
-        // The -1 return value was the actual value, not an error. This means there's no limit.
-        return kj::maxValue;
-      } else {
-        return _XOPEN_IOV_MAX;
-      }
-    }
-
-    return (size_t) iovmax;
-  }();
-  return KJ_IOV_MAX;
+void throwDoubleAdd() {
+  kj::throwFatalException(KJ_EXCEPTION(FAILED,
+      "tried to add element to kj::List but the element is already in a list"));
 }
-#endif
-}  // namespace miniposix
+void throwRemovedNotPresent() {
+  kj::throwFatalException(KJ_EXCEPTION(FAILED,
+      "tried to remove element from kj::List but the element is not in a list"));
+}
+void throwRemovedWrongList() {
+  kj::throwFatalException(KJ_EXCEPTION(FAILED,
+      "tried to remove element from kj::List but the element is in a different list"));
+}
+void throwDestroyedWhileInList() {
+  kj::throwFatalException(KJ_EXCEPTION(FAILED,
+      "destroyed object that is still in a kj::List"));
+}
+
+}  // namespace _
 }  // namespace kj

@@ -70,6 +70,15 @@ Promise<size_t> AsyncInputStream::read(void* buffer, size_t minBytes, size_t max
 
 Maybe<uint64_t> AsyncInputStream::tryGetLength() { return nullptr; }
 
+void AsyncInputStream::registerAncillaryMessageHandler(
+    Function<void(ArrayPtr<AncillaryMessage>)> fn) {
+ KJ_UNIMPLEMENTED("registerAncillaryMsgHandler is not implemented by this AsyncInputStream");
+}
+
+Maybe<Own<AsyncInputStream>> AsyncInputStream::tryTee(uint64_t) {
+  return nullptr;
+}
+
 namespace {
 
 class AsyncPump {
@@ -384,6 +393,35 @@ private:
     }
   }
 
+  template <typename F>
+  static auto teeExceptionVoid(F& fulfiller) {
+    // Returns a functor that can be passed as the second parameter to .then() to propagate the
+    // exception to a given fulfiller. The functor's return type is void.
+    return [&fulfiller](kj::Exception&& e) {
+      fulfiller.reject(kj::cp(e));
+      kj::throwRecoverableException(kj::mv(e));
+    };
+  }
+  template <typename F>
+  static auto teeExceptionSize(F& fulfiller) {
+    // Returns a functor that can be passed as the second parameter to .then() to propagate the
+    // exception to a given fulfiller. The functor's return type is size_t.
+    return [&fulfiller](kj::Exception&& e) -> size_t {
+      fulfiller.reject(kj::cp(e));
+      kj::throwRecoverableException(kj::mv(e));
+      return 0;
+    };
+  }
+  template <typename T, typename F>
+  static auto teeExceptionPromise(F& fulfiller) {
+    // Returns a functor that can be passed as the second parameter to .then() to propagate the
+    // exception to a given fulfiller. The functor's return type is Promise<T>.
+    return [&fulfiller](kj::Exception&& e) -> kj::Promise<T> {
+      fulfiller.reject(kj::cp(e));
+      return kj::mv(e);
+    };
+  }
+
   class BlockedWrite final: public AsyncCapabilityStream {
     // AsyncPipe state when a write() is currently waiting for a corresponding read().
 
@@ -474,7 +512,7 @@ private:
         KJ_SWITCH_ONEOF(capBuffer) {
           KJ_CASE_ONEOF(fds, ArrayPtr<const int>) {
             if (fds.size() > 0 && maxStreams > 0) {
-              // TODO(someday): Maybe AsyncIoStream should have a `Maybe<int> getFd()` method?
+              // TODO(someday): Use AsyncIoStream's `Maybe<int> getFd()` method?
               KJ_FAIL_REQUIRE(
                   "async pipe message was written with FDs attached, but corresponding read "
                   "asked for streams, and we don't know how to convert here");
@@ -523,7 +561,7 @@ private:
           writeBuffer = writeBuffer.slice(amount, writeBuffer.size());
           // We pumped the full amount, so we're done pumping.
           return amount;
-        }));
+        }, teeExceptionSize(fulfiller)));
       }
 
       // First piece doesn't cover the whole pump. Figure out how many more pieces to add.
@@ -557,7 +595,7 @@ private:
             return pipe.pumpTo(output, amount - actual)
                 .then([actual](uint64_t actual2) { return actual + actual2; });
           }
-        }));
+        }, teeExceptionPromise<uint64_t>(fulfiller)));
       } else {
         // Pump ends mid-piece. Write the last, partial piece.
         auto n = amount - actual;
@@ -577,7 +615,7 @@ private:
           morePieces = newMorePieces;
           canceler.release();
           return amount;
-        }));
+        }, teeExceptionSize(fulfiller)));
       }
     }
 
@@ -712,7 +750,7 @@ private:
                               minBytes - actual, maxBytes - actual)
               .then([actual](size_t actual2) { return actual + actual2; });
         }
-      }));
+      }, teeExceptionPromise<size_t>(fulfiller)));
     }
 
     Promise<ReadResult> tryReadWithFds(void* readBuffer, size_t minBytes, size_t maxBytes,
@@ -752,7 +790,7 @@ private:
         // Completed entire pumpTo amount.
         KJ_ASSERT(actual == amount2);
         return amount2;
-      }));
+      }, teeExceptionSize(fulfiller)));
     }
 
     void abortRead() override {
@@ -940,7 +978,7 @@ private:
           }
           KJ_CASE_ONEOF(streamBuffer, ArrayPtr<Own<AsyncCapabilityStream>>) {
             if (streamBuffer.size() > 0 && fds.size() > 0) {
-              // TODO(someday): Maybe AsyncIoStream should have a `Maybe<int> getFd()` method?
+              // TODO(someday): Use AsyncIoStream's `Maybe<int> getFd()` method?
               KJ_FAIL_REQUIRE(
                   "async pipe message was written with FDs attached, but corresponding read "
                   "asked for streams, and we don't know how to convert here");
@@ -1042,7 +1080,7 @@ private:
           // place waiting for more data.
           return actual;
         }
-      }));
+      }, teeExceptionPromise<uint64_t>(fulfiller)));
     }
 
     void shutdownWrite() override {
@@ -1173,7 +1211,7 @@ private:
           KJ_ASSERT(pumpedSoFar == amount);
           return pipe.write(reinterpret_cast<const byte*>(writeBuffer) + actual, size - actual);
         }
-      }));
+      }, teeExceptionPromise<void>(fulfiller)));
     }
 
     Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
@@ -1200,7 +1238,7 @@ private:
               fulfiller.fulfill(kj::cp(amount));
               pipe.endState(*this);
               return pipe.write(partial2.begin(), partial2.size());
-            }));
+            }, teeExceptionPromise<void>(fulfiller)));
             ++i;
           } else {
             // The pump ends exactly at the end of a piece, how nice.
@@ -1208,7 +1246,7 @@ private:
               canceler.release();
               fulfiller.fulfill(kj::cp(amount));
               pipe.endState(*this);
-            }));
+            }, teeExceptionVoid(fulfiller)));
           }
 
           auto remainder = pieces.slice(i, pieces.size());
@@ -1237,7 +1275,7 @@ private:
           fulfiller.fulfill(kj::cp(amount));
           pipe.endState(*this);
         }
-      }));
+      }, teeExceptionVoid(fulfiller)));
     }
 
     Promise<void> writeWithFds(ArrayPtr<const byte> data,
@@ -1302,7 +1340,7 @@ private:
             KJ_ASSERT(pumpedSoFar == amount);
             return input.pumpTo(pipe, amount2 - actual);
           }
-        }));
+        }, teeExceptionPromise<uint64_t>(fulfiller)));
       });
     }
 
@@ -1609,7 +1647,8 @@ private:
     if (limit == 0) {
       inner = nullptr;
     } else if (amount < requested) {
-      KJ_FAIL_REQUIRE("pipe ended prematurely") { break; }
+      kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED,
+          "fixed-length pipe ended prematurely"));
     }
   }
 };
@@ -1645,8 +1684,59 @@ CapabilityPipe newCapabilityPipe() {
 namespace {
 
 class AsyncTee final: public Refcounted {
+  class Buffer {
+  public:
+    Buffer() = default;
+
+    uint64_t consume(ArrayPtr<byte>& readBuffer, size_t& minBytes);
+    // Consume as many bytes as possible, copying them into `readBuffer`. Return the number of bytes
+    // consumed.
+    //
+    // `readBuffer` and `minBytes` are both assigned appropriate new values, such that after any
+    // call to `consume()`, `readBuffer` will point to the remaining slice of unwritten space, and
+    // `minBytes` will have been decremented (clamped to zero) by the amount of bytes read. That is,
+    // the read can be considered fulfilled if `minBytes` is zero after a call to `consume()`.
+
+    Array<const ArrayPtr<const byte>> asArray(uint64_t minBytes, uint64_t& amount);
+    // Consume the first `minBytes` of the buffer (or the entire buffer) and return it in an Array
+    // of ArrayPtr<const byte>s, suitable for passing to AsyncOutputStream.write(). The outer Array
+    // owns the underlying data.
+
+    void produce(Array<byte> bytes);
+    // Enqueue a byte array to the end of the buffer list.
+
+    bool empty() const;
+    uint64_t size() const;
+
+    Buffer clone() const {
+      size_t size = 0;
+      for (const auto& buf: bufferList) {
+        size += buf.size();
+      }
+      auto builder = heapArrayBuilder<byte>(size);
+      for (const auto& buf: bufferList) {
+        builder.addAll(buf);
+      }
+      std::deque<Array<byte>> deque;
+      deque.emplace_back(builder.finish());
+      return Buffer{mv(deque)};
+    }
+
+  private:
+    Buffer(std::deque<Array<byte>>&& buffer) : bufferList(mv(buffer)) {}
+
+    std::deque<Array<byte>> bufferList;
+  };
+
+  class Sink;
+
 public:
   using BranchId = uint;
+
+  struct Branch {
+    Buffer buffer;
+    Maybe<Sink&> sink;
+  };
 
   explicit AsyncTee(Own<AsyncInputStream> inner, uint64_t bufferSizeLimit)
       : inner(mv(inner)), bufferSizeLimit(bufferSizeLimit), length(this->inner->tryGetLength()) {}
@@ -1661,9 +1751,19 @@ public:
     }
   }
 
-  void addBranch(BranchId branch) {
-    KJ_REQUIRE(branches[branch] == nullptr, "branch already exists");
-    branches[branch] = Branch();
+  BranchId addBranch() {
+    return addBranch(Branch());
+  }
+
+  BranchId addBranch(Branch&& branch) {
+    BranchId branchId = branches.size();
+    branches.add(mv(branch));
+    return branchId;
+  }
+
+  Branch cloneBranch(BranchId branchId) const {
+    const auto& state = KJ_ASSERT_NONNULL(branches[branchId]);
+    return {state.buffer.clone(), nullptr};
   }
 
   void removeBranch(BranchId branch) {
@@ -1714,6 +1814,10 @@ public:
     });
   }
 
+  uint64_t getBufferSizeLimit() const {
+    return bufferSizeLimit;
+  }
+
   Promise<uint64_t> pumpTo(BranchId branch, AsyncOutputStream& output, uint64_t amount)  {
     auto& state = KJ_ASSERT_NONNULL(branches[branch]);
     KJ_ASSERT(state.sink == nullptr);
@@ -1739,32 +1843,6 @@ public:
 private:
   struct Eof {};
   using Stoppage = OneOf<Eof, Exception>;
-
-  class Buffer {
-  public:
-    uint64_t consume(ArrayPtr<byte>& readBuffer, size_t& minBytes);
-    // Consume as many bytes as possible, copying them into `readBuffer`. Return the number of bytes
-    // consumed.
-    //
-    // `readBuffer` and `minBytes` are both assigned appropriate new values, such that after any
-    // call to `consume()`, `readBuffer` will point to the remaining slice of unwritten space, and
-    // `minBytes` will have been decremented (clamped to zero) by the amount of bytes read. That is,
-    // the read can be considered fulfilled if `minBytes` is zero after a call to `consume()`.
-
-    Array<const ArrayPtr<const byte>> asArray(uint64_t minBytes, uint64_t& amount);
-    // Consume the first `minBytes` of the buffer (or the entire buffer) and return it in an Array
-    // of ArrayPtr<const byte>s, suitable for passing to AsyncOutputStream.write(). The outer Array
-    // owns the underlying data.
-
-    void produce(Array<byte> bytes);
-    // Enqueue a byte array to the end of the buffer list.
-
-    bool empty() const;
-    uint64_t size() const;
-
-  private:
-    std::deque<Array<byte>> bufferList;
-  };
 
   class Sink {
   public:
@@ -1838,11 +1916,6 @@ private:
 
     PromiseFulfiller<T>& fulfiller;
     Maybe<Sink&>& sinkLink;
-  };
-
-  struct Branch {
-    Buffer buffer;
-    Maybe<Sink&> sink;
   };
 
   class ReadSink final: public SinkBase<size_t> {
@@ -2021,7 +2094,7 @@ private:
   Own<AsyncInputStream> inner;
   const uint64_t bufferSizeLimit = kj::maxValue;
   Maybe<uint64_t> length;
-  Maybe<Branch> branches[2];
+  Vector<Maybe<Branch>> branches;
   Maybe<Stoppage> stoppage;
   Promise<void> pullPromise = READY_NOW;
   bool pulling = false;
@@ -2221,9 +2294,11 @@ uint64_t AsyncTee::Buffer::size() const {
 
 class TeeBranch final: public AsyncInputStream {
 public:
-  TeeBranch(Own<AsyncTee> tee, uint8_t branch): tee(mv(tee)), branch(branch) {
-    this->tee->addBranch(branch);
-  }
+  TeeBranch(Own<AsyncTee> teeArg): tee(mv(teeArg)), branch(tee->addBranch()) {}
+
+  TeeBranch(Badge<TeeBranch>, Own<AsyncTee> teeArg, AsyncTee::Branch&& branchState)
+      : tee(mv(teeArg)), branch(tee->addBranch(mv(branchState))) {}
+
   ~TeeBranch() noexcept(false) {
     unwind.catchExceptionsIfUnwinding([&]() {
       tee->removeBranch(branch);
@@ -2242,18 +2317,32 @@ public:
     return tee->tryGetLength(branch);
   }
 
+  Maybe<Own<AsyncInputStream>> tryTee(uint64_t limit) override {
+    if (tee->getBufferSizeLimit() != limit) {
+      // Cannot optimize this path as the limit has changed, so we need a new AsyncTee to manage
+      // the limit.
+      return nullptr;
+    }
+
+    return kj::heap<TeeBranch>(Badge<TeeBranch>{}, addRef(*tee), tee->cloneBranch(branch));
+  }
+
 private:
   Own<AsyncTee> tee;
-  const uint8_t branch;
+  const uint branch;
   UnwindDetector unwind;
 };
 
 }  // namespace
 
 Tee newTee(Own<AsyncInputStream> input, uint64_t limit) {
+  KJ_IF_MAYBE(t, input->tryTee()) {
+    return { { mv(input), mv(*t) }};
+  }
+
   auto impl = refcounted<AsyncTee>(mv(input), limit);
-  Own<AsyncInputStream> branch1 = heap<TeeBranch>(addRef(*impl), 0);
-  Own<AsyncInputStream> branch2 = heap<TeeBranch>(mv(impl), 1);
+  Own<AsyncInputStream> branch1 = heap<TeeBranch>(addRef(*impl));
+  Own<AsyncInputStream> branch2 = heap<TeeBranch>(mv(impl));
   return { { mv(branch1), mv(branch2) } };
 }
 
@@ -2375,6 +2464,14 @@ public:
       tasks.add(promise.addBranch().then([this]() {
         return KJ_ASSERT_NONNULL(stream)->abortRead();
       }));
+    }
+  }
+
+  kj::Maybe<int> getFd() const override {
+    KJ_IF_MAYBE(s, stream) {
+      return s->get()->getFd();
+    } else {
+      return nullptr;
     }
   }
 

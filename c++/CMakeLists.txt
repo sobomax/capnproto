@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.4)
 project("Cap'n Proto" CXX)
-set(VERSION 0.9-dev)
+set(VERSION 0.10-dev)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -163,6 +163,7 @@ if(NOT MSVC)  # Don't install pkg-config files when building with MSVC
       pkgconfig/kj-test.pc
       pkgconfig/kj-tls.pc
       pkgconfig/capnp-rpc.pc
+      pkgconfig/capnp-websocket.pc
       pkgconfig/capnp-json.pc
     )
   endif()

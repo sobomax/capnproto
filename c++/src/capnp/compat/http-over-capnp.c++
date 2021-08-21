@@ -157,6 +157,7 @@ public:
     auto req = KJ_REQUIRE_NONNULL(out, "already called disconnect()").sendDataRequest(
         MessageSize { 8 + message.size() / sizeof(word), 0 });
     req.setData(message);
+    sentBytes += message.size();
     return req.send();
   }
 
@@ -164,6 +165,7 @@ public:
     auto req = KJ_REQUIRE_NONNULL(out, "already called disconnect()").sendTextRequest(
         MessageSize { 8 + message.size() / sizeof(word), 0 });
     memcpy(req.initText(message.size()).begin(), message.begin(), message.size());
+    sentBytes += message.size();
     return req.send();
   }
 
@@ -171,6 +173,7 @@ public:
     auto req = KJ_REQUIRE_NONNULL(out, "already called disconnect()").closeRequest();
     req.setCode(code);
     req.setReason(reason);
+    sentBytes += reason.size() + 2;
     return req.send().ignoreResult();
   }
 
@@ -203,8 +206,8 @@ public:
     });
   }
 
-  kj::Promise<Message> receive() override {
-    return KJ_ASSERT_NONNULL(in)->receive();
+  kj::Promise<Message> receive(size_t maxSize) override {
+    return KJ_ASSERT_NONNULL(in)->receive(maxSize);
   }
 
   kj::Promise<void> pumpTo(WebSocket& other) override {
@@ -223,10 +226,14 @@ public:
     }
   }
 
+  uint64_t sentByteCount() override { return sentBytes; }
+  uint64_t receivedByteCount() override { return KJ_ASSERT_NONNULL(in)->receivedByteCount(); }
+
 private:
   kj::Maybe<kj::Own<kj::WebSocket>> in;   // One end of a WebSocketPipe, used only for receiving.
   kj::Maybe<capnp::WebSocket::Client> out;  // Used only for sending.
   kj::Own<kj::PromiseFulfiller<kj::Promise<Capability::Client>>> shorteningFulfiller;
+  uint64_t sentBytes = 0;
 };
 
 // =======================================================================================
@@ -450,11 +457,12 @@ class HttpOverCapnpFactory::ServerRequestContextImpl final
       public kj::HttpService::Response {
 public:
   ServerRequestContextImpl(HttpOverCapnpFactory& factory,
+                           HttpService::Client serviceCap,
                            capnp::HttpRequest::Reader request,
                            capnp::HttpService::ClientRequestContext::Client clientContext,
                            kj::Own<kj::AsyncInputStream> requestBodyIn,
                            kj::HttpService& kjService)
-      : factory(factory),
+      : factory(factory), serviceCap(kj::mv(serviceCap)),
         method(validateMethod(request.getMethod())),
         url(kj::str(request.getUrl())),
         headers(factory.headersToKj(request.getHeaders()).clone()),
@@ -560,6 +568,7 @@ public:
 
 private:
   HttpOverCapnpFactory& factory;
+  HttpService::Client serviceCap;  // ensures the inner kj::HttpService isn't destroyed
   kj::HttpMethod method;
   kj::String url;
   kj::HttpHeaders headers;
@@ -601,7 +610,7 @@ public:
       requestBody = kj::heap<NullInputStream>();
     }
     results.setContext(kj::heap<ServerRequestContextImpl>(
-        factory, metadata, params.getContext(), kj::mv(requestBody), *inner));
+        factory, thisCap(), metadata, params.getContext(), kj::mv(requestBody), *inner));
 
     return kj::READY_NOW;
   }
@@ -621,11 +630,9 @@ static constexpr uint64_t COMMON_TEXT_ANNOTATION = 0x857745131db6fc83ull;
 // Type ID of `commonText` from `http.capnp`.
 // TODO(cleanup): Cap'n Proto should auto-generate constants for these.
 
-HttpOverCapnpFactory::HttpOverCapnpFactory(ByteStreamFactory& streamFactory,
-                                           kj::HttpHeaderTable::Builder& headerTableBuilder)
-    : streamFactory(streamFactory), headerTable(headerTableBuilder.getFutureTable()) {
+HttpOverCapnpFactory::HeaderIdBundle::HeaderIdBundle(kj::HttpHeaderTable::Builder& builder)
+    : table(builder.getFutureTable()) {
   auto commonHeaderNames = Schema::from<capnp::CommonHeaderName>().getEnumerants();
-  size_t maxHeaderId = 0;
   nameCapnpToKj = kj::heapArray<kj::HttpHeaderId>(commonHeaderNames.size());
   for (size_t i = 1; i < commonHeaderNames.size(); i++) {
     kj::StringPtr nameText;
@@ -636,12 +643,26 @@ HttpOverCapnpFactory::HttpOverCapnpFactory(ByteStreamFactory& streamFactory,
       }
     }
     KJ_ASSERT(nameText != nullptr);
-    kj::HttpHeaderId headerId = headerTableBuilder.add(nameText);
+    kj::HttpHeaderId headerId = builder.add(nameText);
     nameCapnpToKj[i] = headerId;
     maxHeaderId = kj::max(maxHeaderId, headerId.hashCode());
   }
+}
 
-  nameKjToCapnp = kj::heapArray<capnp::CommonHeaderName>(maxHeaderId + 1);
+HttpOverCapnpFactory::HeaderIdBundle::HeaderIdBundle(
+    const kj::HttpHeaderTable& table, kj::Array<kj::HttpHeaderId> nameCapnpToKj, size_t maxHeaderId)
+    : table(table), nameCapnpToKj(kj::mv(nameCapnpToKj)), maxHeaderId(maxHeaderId) {}
+
+HttpOverCapnpFactory::HeaderIdBundle HttpOverCapnpFactory::HeaderIdBundle::clone() const {
+  return HeaderIdBundle(table, kj::heapArray<kj::HttpHeaderId>(nameCapnpToKj), maxHeaderId);
+}
+
+HttpOverCapnpFactory::HttpOverCapnpFactory(ByteStreamFactory& streamFactory,
+                                           HeaderIdBundle headerIds)
+    : streamFactory(streamFactory), headerTable(headerIds.table),
+      nameCapnpToKj(kj::mv(headerIds.nameCapnpToKj)) {
+  auto commonHeaderNames = Schema::from<capnp::CommonHeaderName>().getEnumerants();
+  nameKjToCapnp = kj::heapArray<capnp::CommonHeaderName>(headerIds.maxHeaderId + 1);
   for (auto& slot: nameKjToCapnp) slot = capnp::CommonHeaderName::INVALID;
 
   for (size_t i = 1; i < commonHeaderNames.size(); i++) {

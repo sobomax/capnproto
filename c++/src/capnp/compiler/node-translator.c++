@@ -130,6 +130,11 @@ public:
         // No expansion requested.
         return true;
       }
+      if (oldLgSize == kj::size(holes)) {
+        // Old value is already a full word. Further expansion is impossible.
+        return false;
+      }
+      KJ_ASSERT(oldLgSize < kj::size(holes));
       if (holes[oldLgSize] != oldOffset + 1) {
         // The space immediately after the location is not a hole.
         return false;
@@ -1888,7 +1893,7 @@ kj::Maybe<Orphan<DynamicValue>> ValueTranslator::compileValue(Expression::Reader
         return kj::mv(result);
       }
 
-    } // fallthrough -- value is positive, so we can just go on to the uint case below.
+    } KJ_FALLTHROUGH;  // value is positive, so we can just go on to the uint case below.
 
     case DynamicValue::UINT: {
       uint64_t maxValue = 0;

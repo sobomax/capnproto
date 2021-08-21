@@ -87,6 +87,18 @@ private:
   int& handleCount;
 };
 
+class TestMonotonicClock final: public kj::MonotonicClock {
+public:
+  kj::TimePoint now() const override {
+    return time;
+  }
+
+  void reset() { time = kj::systemCoarseMonotonicClock().now(); }
+  void increment(kj::Duration d) { time += d; }
+private:
+  kj::TimePoint time = kj::systemCoarseMonotonicClock().now();
+};
+
 kj::AsyncIoProvider::PipeThread runServer(kj::AsyncIoProvider& ioProvider,
                                           int& callCount, int& handleCount) {
   return ioProvider.newPipeThread(
@@ -117,16 +129,27 @@ Capability::Client getPersistentCap(RpcSystem<rpc::twoparty::VatId>& client,
 
 TEST(TwoPartyNetwork, Basic) {
   auto ioContext = kj::setupAsyncIo();
+  TestMonotonicClock clock;
   int callCount = 0;
   int handleCount = 0;
 
   auto serverThread = runServer(*ioContext.provider, callCount, handleCount);
-  TwoPartyVatNetwork network(*serverThread.pipe, rpc::twoparty::Side::CLIENT);
+  TwoPartyVatNetwork network(*serverThread.pipe, rpc::twoparty::Side::CLIENT, capnp::ReaderOptions(), clock);
   auto rpcClient = makeRpcClient(network);
+
+  KJ_EXPECT(network.getCurrentQueueCount() == 0);
+  KJ_EXPECT(network.getCurrentQueueSize() == 0);
+  KJ_EXPECT(network.getOutgoingMessageWaitTime() == 0 * kj::SECONDS);
 
   // Request the particular capability from the server.
   auto client = getPersistentCap(rpcClient, rpc::twoparty::Side::SERVER,
       test::TestSturdyRefObjectId::Tag::TEST_INTERFACE).castAs<test::TestInterface>();
+  clock.increment(1 * kj::SECONDS);
+
+  KJ_EXPECT(network.getCurrentQueueCount() == 1);
+  KJ_EXPECT(network.getCurrentQueueSize() > 0);
+  KJ_EXPECT(network.getOutgoingMessageWaitTime() == 1 * kj::SECONDS);
+  size_t oldSize = network.getCurrentQueueSize();
 
   // Use the capability.
   auto request1 = client.fooRequest();
@@ -134,9 +157,20 @@ TEST(TwoPartyNetwork, Basic) {
   request1.setJ(true);
   auto promise1 = request1.send();
 
+  KJ_EXPECT(network.getCurrentQueueCount() == 2);
+  KJ_EXPECT(network.getCurrentQueueSize() > oldSize);
+  KJ_EXPECT(network.getOutgoingMessageWaitTime() == 1 * kj::SECONDS);
+  oldSize = network.getCurrentQueueSize();
+
   auto request2 = client.bazRequest();
   initTestMessage(request2.initS());
   auto promise2 = request2.send();
+
+  KJ_EXPECT(network.getCurrentQueueCount() == 3);
+  KJ_EXPECT(network.getCurrentQueueSize() > oldSize);
+  oldSize = network.getCurrentQueueSize();
+
+  clock.increment(1 * kj::SECONDS);
 
   bool barFailed = false;
   auto request3 = client.barRequest();
@@ -149,6 +183,12 @@ TEST(TwoPartyNetwork, Basic) {
 
   EXPECT_EQ(0, callCount);
 
+  KJ_EXPECT(network.getCurrentQueueCount() == 4);
+  KJ_EXPECT(network.getCurrentQueueSize() > oldSize);
+  // Oldest message is now 2 seconds old
+  KJ_EXPECT(network.getOutgoingMessageWaitTime() == 2 * kj::SECONDS);
+  oldSize = network.getCurrentQueueSize();
+
   auto response1 = promise1.wait(ioContext.waitScope);
 
   EXPECT_EQ("foo", response1.getX());
@@ -159,6 +199,20 @@ TEST(TwoPartyNetwork, Basic) {
 
   EXPECT_EQ(2, callCount);
   EXPECT_TRUE(barFailed);
+
+  // There's still a `Finish` message queued.
+  KJ_EXPECT(network.getCurrentQueueCount() > 0);
+  KJ_EXPECT(network.getCurrentQueueSize() > 0);
+  // Oldest message was sent, next oldest should be 0 seconds old since we haven't incremented
+  // the clock yet.
+  KJ_EXPECT(network.getOutgoingMessageWaitTime() == 0 * kj::SECONDS);
+
+  // Let any I/O finish.
+  kj::Promise<void>(kj::NEVER_DONE).poll(ioContext.waitScope);
+
+  // Now nothing is queued.
+  KJ_EXPECT(network.getCurrentQueueCount() == 0);
+  KJ_EXPECT(network.getCurrentQueueSize() == 0);
 }
 
 TEST(TwoPartyNetwork, Pipelining) {

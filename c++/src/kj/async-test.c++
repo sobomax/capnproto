@@ -25,6 +25,19 @@
 #include "mutex.h"
 #include "thread.h"
 
+// TODO(later): Refactor this more cleanly so that the KJ library itself defines this.
+#if !__BIONIC__ && !KJ_NO_EXCEPTIONS
+#define KJ_FIBERS_AVAILABLE 1
+#else
+#define KJ_FIBERS_AVAILABLE 0
+#endif
+
+#if !KJ_FIBERS_AVAILABLE
+// For bionic, OpenBSD, and no-exception builds, enables the regression test for
+// kj::TaskSet::~TaskSet potentially causing a stack overflow.
+#include <pthread.h>
+#endif
+
 namespace kj {
 namespace {
 
@@ -478,14 +491,28 @@ TEST(Async, Fork) {
 
   auto fork = promise.fork();
 
+#if __GNUC__ && !__clang__ && __GNUC__ >= 7
+// GCC 7 decides the open-brace below is "misleadingly indented" as if it were guarded by the `for`
+// that appears in the implementation of KJ_REQUIRE(). Shut up shut up shut up.
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
+#endif
+  KJ_ASSERT(!fork.hasBranches());
+  {
+    auto cancelBranch = fork.addBranch();
+    KJ_ASSERT(fork.hasBranches());
+  }
+  KJ_ASSERT(!fork.hasBranches());
+
   auto branch1 = fork.addBranch().then([](int i) {
     EXPECT_EQ(123, i);
     return 456;
   });
+  KJ_ASSERT(fork.hasBranches());
   auto branch2 = fork.addBranch().then([](int i) {
     EXPECT_EQ(123, i);
     return 789;
   });
+  KJ_ASSERT(fork.hasBranches());
 
   {
     auto releaseFork = kj::mv(fork);
@@ -527,6 +554,34 @@ TEST(Async, ForkRef) {
   EXPECT_EQ(456, branch1.wait(waitScope));
   EXPECT_EQ(789, branch2.wait(waitScope));
 }
+
+TEST(Async, ForkMaybeRef) {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  Promise<Maybe<Own<RefcountedInt>>> promise = evalLater([&]() {
+    return Maybe<Own<RefcountedInt>>(refcounted<RefcountedInt>(123));
+  });
+
+  auto fork = promise.fork();
+
+  auto branch1 = fork.addBranch().then([](Maybe<Own<RefcountedInt>>&& i) {
+    EXPECT_EQ(123, KJ_REQUIRE_NONNULL(i)->i);
+    return 456;
+  });
+  auto branch2 = fork.addBranch().then([](Maybe<Own<RefcountedInt>>&& i) {
+    EXPECT_EQ(123, KJ_REQUIRE_NONNULL(i)->i);
+    return 789;
+  });
+
+  {
+    auto releaseFork = kj::mv(fork);
+  }
+
+  EXPECT_EQ(456, branch1.wait(waitScope));
+  EXPECT_EQ(789, branch2.wait(waitScope));
+}
+
 
 TEST(Async, Split) {
   EventLoop loop;
@@ -689,6 +744,45 @@ TEST(Async, TaskSet) {
 
   EXPECT_EQ(4, counter);
   EXPECT_EQ(1u, errorHandler.exceptionCount);
+}
+
+TEST(Async, LargeTaskSetDestruction) {
+  static constexpr size_t stackSize = 200 * 1024;
+
+  static auto testBody = [] {
+
+    ErrorHandlerImpl errorHandler;
+    TaskSet tasks(errorHandler);
+
+    for (int i = 0; i < stackSize / sizeof(void*); i++) {
+      tasks.add(kj::NEVER_DONE);
+    }
+  };
+
+#if KJ_FIBERS_AVAILABLE
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  startFiber(stackSize,
+      [](WaitScope&) mutable {
+    testBody();
+  }).wait(waitScope);
+
+#else
+  pthread_attr_t attr;
+  KJ_REQUIRE(0 == pthread_attr_init(&attr));
+  KJ_DEFER(KJ_REQUIRE(0 == pthread_attr_destroy(&attr)));
+
+  KJ_REQUIRE(0 == pthread_attr_setstacksize(&attr, stackSize));
+  pthread_t thread;
+  KJ_REQUIRE(0 == pthread_create(&thread, &attr, [](void*) -> void* {
+    EventLoop loop;
+    WaitScope waitScope(loop);
+    testBody();
+    return nullptr;
+  }, nullptr));
+  KJ_REQUIRE(0 == pthread_join(thread, nullptr));
+#endif
 }
 
 TEST(Async, TaskSet) {
@@ -904,7 +998,7 @@ KJ_TEST("exclusiveJoin both events complete simultaneously") {
   KJ_EXPECT(!joined.poll(waitScope));
 }
 
-#if !__BIONIC__ && !KJ_NO_EXCEPTIONS
+#if KJ_FIBERS_AVAILABLE && !KJ_NO_EXCEPTIONS
 KJ_TEST("start a fiber") {
   EventLoop loop;
   WaitScope waitScope(loop);
