@@ -7,7 +7,7 @@ doit() {
   "$@"
 }
 
-function test_samples() {
+test_samples() {
   echo "@@@@ ./addressbook (in various configurations)"
   ./addressbook write | ./addressbook read
   ./addressbook dwrite | ./addressbook dread
